@@ -278,8 +278,22 @@ int smb2_net_fcntl(int fd, int cmd, ...)
         return (int)ret;
 }
 
+#ifdef __wii__
+/* On the Wii, libogc's net_read()/net_write() copy the whole buffer through a
+ * fixed 64 KB heap shared with IOS. A request that doesn't fit (e.g. the ~64 KB
+ * reply to a large directory query, or a big write) fails with IPC_ENOMEM and
+ * leaves the SMB stream out of sync. Both calls may return fewer bytes than
+ * asked for, and libsmb2 resumes partial PDUs, so cap the size of a single call. */
+#define SMB2_WII_MAX_NET_CHUNK 8192
+#endif
+
 ssize_t smb2_net_write(int fd, const void *buf, size_t count)
 {
+#ifdef __wii__
+        if (count > SMB2_WII_MAX_NET_CHUNK) {
+                count = SMB2_WII_MAX_NET_CHUNK;
+        }
+#endif
         s32 ret = net_write(fd, buf, count);
         if (ret < 0) {
                 errno = -ret;
@@ -290,6 +304,26 @@ ssize_t smb2_net_write(int fd, const void *buf, size_t count)
 
 ssize_t smb2_net_read(int fd, void *buf, size_t count)
 {
+#ifdef __wii__
+        /* The socket is non-blocking, but net_read() can still block when there
+         * is nothing to read, so libsmb2's "read until EAGAIN" loop never ends
+         * and smb2_service() does not return. Only read when select() says
+         * there is data. */
+        fd_set rd;
+        struct timeval tv;
+
+        FD_ZERO(&rd);
+        FD_SET(fd, &rd);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        if (net_select(fd + 1, &rd, NULL, NULL, &tv) == 0) {
+                errno = EAGAIN;
+                return -1;
+        }
+        if (count > SMB2_WII_MAX_NET_CHUNK) {
+                count = SMB2_WII_MAX_NET_CHUNK;
+        }
+#endif
         s32 ret = net_read(fd, buf, count);
         if (ret < 0) {
                 errno = -ret;
