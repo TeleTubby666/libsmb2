@@ -291,18 +291,21 @@ ssize_t smb2_net_write(int fd, const void *buf, size_t count)
 ssize_t smb2_net_read(int fd, void *buf, size_t count)
 {
 #ifdef __wii__
-        /* The socket is non-blocking, but net_read() can still block when there
-         * is nothing to read, so libsmb2's "read until EAGAIN" loop never ends
-         * and smb2_service() does not return. Only read when select() says
-         * there is data. */
-        fd_set rd;
+        /* On the Wii net_read() can block when there is nothing to read even
+         * though the socket is non-blocking, so libsmb2's "read until EAGAIN"
+         * loop never ends and smb2_service() does not return. Only read when
+         * select() says there is data (or an error/hangup, which net_read()
+         * then reports), otherwise report EAGAIN. */
+        fd_set rd, ex;
         struct timeval tv;
 
         FD_ZERO(&rd);
         FD_SET(fd, &rd);
+        FD_ZERO(&ex);
+        FD_SET(fd, &ex);
         tv.tv_sec = 0;
         tv.tv_usec = 0;
-        if (net_select(fd + 1, &rd, NULL, NULL, &tv) == 0) {
+        if (net_select(fd + 1, &rd, NULL, &ex, &tv) == 0) {
                 errno = EAGAIN;
                 return -1;
         }
