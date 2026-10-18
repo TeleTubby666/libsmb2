@@ -171,6 +171,20 @@ struct smb2_context {
 
         int timeout;
 
+#ifdef HAVE_LIBQUIC
+        /* "quic" URL argument: SMB2 over QUIC (MS-SMB2 2.1) using the
+         * kernel QUIC module, see quic.c */
+        int quic;
+        int quic_stream_open;
+        struct smb2_quic_handshake *quic_hs;
+#endif
+#ifdef HAVE_LIBRDMACM
+        /* "rdma" URL argument: SMB2 over SMB Direct [MS-SMBD], see
+         * smbdirect.c. smb2->fd is an epoll fd for the RDMA channels. */
+        int rdma;
+        struct smb2_rdma *rdma_conn;
+#endif
+
         enum smb2_sec sec;
 
         uint16_t security_mode;
@@ -221,7 +235,10 @@ struct smb2_context {
         uint8_t seal:1;
         int8_t seal_requested;
         uint8_t sign:1;
+        /* SMB3 encryption keys derived; sealed clients refuse plaintext from here on */
+        uint8_t enc_keys_ready:1;
         uint8_t signing_key[SMB2_KEY_SIZE];
+        uint8_t application_key[SMB2_KEY_SIZE];
         uint8_t serverin_key[SMB2_KEY_SIZE];
         uint8_t serverout_key[SMB2_KEY_SIZE];
         uint8_t salt[SMB2_SALT_SIZE];
@@ -324,12 +341,29 @@ typedef void (*smb2_free_payload)(struct smb2_context *smb2, void *payload);
 
 #define SMB2_MAX_PDU_SIZE 16*1024*1024
 
+/* headroom over the negotiated read/write size for headers and the transform header */
+#define SMB2_RECV_PDU_SLACK (64 * 1024)
+
+/* cap peer-supplied PDU lengths to the negotiated read/write size, never above SMB2_MAX_PDU_SIZE */
+static inline uint32_t
+smb2_recv_pdu_cap(const struct smb2_context *smb2)
+{
+        uint32_t max = smb2->max_read_size > smb2->max_write_size ?
+                smb2->max_read_size : smb2->max_write_size;
+
+        if (max == 0 || max > SMB2_MAX_PDU_SIZE - SMB2_RECV_PDU_SLACK) {
+                return SMB2_MAX_PDU_SIZE;
+        }
+        return max + SMB2_RECV_PDU_SLACK;
+}
+
 struct smb2_pdu {
         struct smb2_pdu *next;
         struct smb2_header header;
 
         struct smb2_pdu *next_compound;
         uint64_t prev_compound_mid;
+        int unrelated_compound;
 
         int caller_frees_pdu;
         /*
@@ -394,6 +428,14 @@ struct smb2dir {
         void *cb_data;
         smb2_file_id file_id;
 
+        /*
+         * For smb2_opendir_async_pdu(): the pdu the caller owns, until the
+         * first callback runs. Freeing the pdu before that cancels the
+         * opendir, which then frees dir and calls cancel_free_cb(cb_data).
+         */
+        struct smb2_pdu *cancel_pdu;
+        void (*cancel_free_cb)(void *);
+
         struct smb2_dirent_internal *entries;
         struct smb2_dirent_internal *current_entry;
         int index;
@@ -406,6 +448,38 @@ void smb2_set_nterror(struct smb2_context *smb2, int nterror,
                     const char *error_string, ...);
 
 void smb2_close_connecting_fds(struct smb2_context *smb2);
+
+#ifdef HAVE_LIBQUIC
+#ifndef IPPROTO_QUIC
+#define IPPROTO_QUIC 261
+#endif
+struct iovec;
+int smb2_quic_handshake_start(struct smb2_context *smb2);
+int smb2_quic_handshake_service(struct smb2_context *smb2);
+int smb2_quic_events(struct smb2_context *smb2);
+ssize_t smb2_quic_writev(struct smb2_context *smb2,
+                         const struct iovec *iov, int iovcnt);
+void smb2_quic_reset(struct smb2_context *smb2);
+#else
+#define smb2_quic_reset(smb2) do { } while (0)
+#endif
+
+#ifdef HAVE_LIBRDMACM
+struct iovec;
+struct addrinfo;
+int smb2_rdma_connect(struct smb2_context *smb2, const struct addrinfo *ai);
+int smb2_rdma_connected(struct smb2_context *smb2);
+int smb2_rdma_service(struct smb2_context *smb2);
+int smb2_rdma_flush_output(struct smb2_context *smb2);
+ssize_t smb2_rdma_writev(struct smb2_context *smb2,
+                         const struct iovec *iov, int iovcnt);
+ssize_t smb2_rdma_readv(struct smb2_context *smb2,
+                        const struct iovec *iov, int iovcnt);
+void smb2_rdma_cap_io_sizes(struct smb2_context *smb2);
+void smb2_rdma_reset(struct smb2_context *smb2);
+#else
+#define smb2_rdma_reset(smb2) do { } while (0)
+#endif
 
 void *smb2_alloc_init(struct smb2_context *smb2, size_t size);
 void *smb2_alloc_data(struct smb2_context *smb2, void *memctx, size_t size);
@@ -726,39 +800,6 @@ int smb2_decode_reparse_data_buffer(struct smb2_context *smb2,
 int smb2_read_from_buf(struct smb2_context *smb2);
 void smb2_change_events(struct smb2_context *smb2, t_socket fd, int events);
 void smb2_timeout_pdus(struct smb2_context *smb2);
-
-struct dcerpc_context;
-struct dcerpc_iovec;
-int dcerpc_set_uint8(struct dcerpc_context *ctx, struct dcerpc_iovec *iov,
-                     int *offset, uint8_t value);
-
-struct dcerpc_pdu;
-int dcerpc_pdu_direction(struct dcerpc_pdu *pdu);
-enum dcerpc_encoding dcerpc_pdu_encoding(struct dcerpc_pdu *pdu);
-int dcerpc_pdu_is_conformance_run(struct dcerpc_pdu *pdu);
-void dcerpc_pdu_raise_max_alignment(struct dcerpc_pdu *pdu, int alignment);
-int dcerpc_get_cr(struct dcerpc_pdu *pdu);
-
-int dcerpc_align_3264(struct dcerpc_context *ctx, int offset);
-
-/* YAML/JSON helpers — full libdcerpc only (not minimal libsmb2 share enum) */
-#ifdef HAVE_DCERPC_FULL
-char *dcerpc_pdu_yaml_key(struct dcerpc_pdu *pdu);
-char *dcerpc_pdu_yaml_val(struct dcerpc_pdu *pdu);
-void dcerpc_pdu_clear_yaml_key(struct dcerpc_pdu *pdu);
-char *dcerpc_pdu_json_key(struct dcerpc_pdu *pdu);
-int dcerpc_json_next_key(struct dcerpc_pdu *pdu, struct dcerpc_iovec *iov,
-                         int *offset);
-void yaml_print_preamble(struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
-                         struct dcerpc_iovec *iov, int *offset);
-int yaml_next_kv(struct dcerpc_pdu *pdu, struct dcerpc_iovec *iov, int *offset);
-void json_sep(struct dcerpc_pdu *pdu, struct dcerpc_iovec *iov, int *offset);
-int json_append(struct dcerpc_iovec *iov, int *offset, const char *s);
-int json_append_quoted(struct dcerpc_iovec *iov, int *offset, const char *s);
-int json_parse_string(struct dcerpc_iovec *iov, int *offset, char **start);
-int json_expect_key(struct dcerpc_pdu *pdu, struct dcerpc_iovec *iov, int *offset,
-                    const char *name);
-#endif
 
 struct connect_data;                                           /* defined in libsmb2.c */
 void free_c_data(struct smb2_context*, struct connect_data*);  /* defined in libsmb2.c */

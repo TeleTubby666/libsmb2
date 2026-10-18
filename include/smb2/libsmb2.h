@@ -24,6 +24,7 @@ extern "C" {
 #endif
 
 #define LIBSMB2_SHARE_ENUM_V2 1
+#define LIBSMB2_SRVSVC_V2 1
 
 struct smb2_iovec {
         uint8_t *buf;
@@ -374,6 +375,23 @@ void smb2_get_libsmb2Version(struct smb2_libversion *smb2_ver);
 uint16_t smb2_get_dialect(struct smb2_context *smb2);
 
 /*
+ * Gets the NDR transfer syntax selected with the ndr3264/ndr32/ndr64
+ * URL arguments, for use by DCE/RPC layers such as libdcerpc.
+ *  0 : offer both NDR32 and NDR64 (default)
+ *  1 : NDR32 only
+ *  2 : NDR64 only
+ */
+int smb2_get_ndr(struct smb2_context *smb2);
+
+/*
+ * Gets the DCE/RPC data representation selected with the le/be URL
+ * arguments.
+ *  0 : little endian (default)
+ *  1 : big endian
+ */
+int smb2_get_endianness(struct smb2_context *smb2);
+
+/*
  * Set the security mode for the connection.
  * This is a combination of the flags SMB2_NEGOTIATE_SIGNING_ENABLED
  * and  SMB2_NEGOTIATE_SIGNING_REQUIRED
@@ -527,6 +545,16 @@ const char *smb2_get_client_guid(struct smb2_context *smb2);
  * Returns the server_guid for this context.
  */
 const char *smb2_get_server_guid(struct smb2_context *smb2);
+
+/*
+ * Copies the application key of the session to key: Session.ApplicationKey
+ * of [MS-SMB2] 3.2.5.3.1, which DCE/RPC over a named pipe uses as its
+ * session key, e.g. to encrypt the password buffers of SAMR.
+ *
+ * Returns 0 on success, or -EINVAL if there is no logged-on session with
+ * a session key.
+ */
+int smb2_get_application_key(struct smb2_context *smb2, uint8_t key[16]);
         
 /*
  * Asynchronous call to connect a TCP connection to the server
@@ -691,6 +719,21 @@ void smb2_destroy_url(struct smb2_url *url);
  */
 void smb2_add_compound_pdu(struct smb2_context *smb2,
                            struct smb2_pdu *pdu, struct smb2_pdu *next_pdu);
+
+/*
+ * Like smb2_add_compound_pdu() but does NOT set
+ * SMB2_FLAGS_RELATED_OPERATIONS on next_pdu. Use this when chaining
+ * independent requests to different files in one compound packet
+ * (unrelated compounding, MS-SMB2 3.2.4.1.4). smb2_add_compound_pdu()
+ * sets SMB2_FLAGS_RELATED_OPERATIONS which tells the server to use the
+ * file handle from the previous response -- correct for related chains
+ * (CREATE->QUERY->CLOSE on the same file) but causes STATUS_FILE_CLOSED
+ * when used for independent operations on different files.
+ */
+void smb2_add_unrelated_compound_pdu(struct smb2_context *smb2,
+                                     struct smb2_pdu *pdu,
+                                     struct smb2_pdu *next_pdu);
+
 void smb2_free_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu);
 void smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu);
 
@@ -720,7 +763,7 @@ struct smb2dir;
  *          through the callback function.
  *          The pdu must be freed by smb2_free_pdu().
  *          The pdu can be cancelled before the callback is invoked by freeing
- *          it.
+ *          it. free_cb, if not NULL, is then called with cb_data.
  * NULL :   There was an error. The callback function will not be invoked.
  *
  * When the callback is invoked, status indicates the result:
@@ -798,7 +841,7 @@ struct smb2fh;
  *          through the callback function.
  *          The pdu must be freed by smb2_free_pdu().
  *          The pdu can be cancelled before the callback is invoked by freeing
- *          it.
+ *          it. free_cb, if not NULL, is then called with cb_data.
  * NULL :   There was an error. The callback function will not be invoked.
  *
  * Opens or creates a file.

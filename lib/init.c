@@ -185,6 +185,21 @@ smb2_parse_args(struct smb2_context *smb2, char *args)
                                 return -1;
                         }
                         smb2->timeout = (int)strtol(value, NULL, 10);
+                } else if (!strcmp(args, "quic")) {
+#ifdef HAVE_LIBQUIC
+                        smb2->quic = 1;
+#else
+                        smb2_set_error(smb2, "quic: built without libquic");
+                        return -1;
+#endif
+                } else if (!strcmp(args, "rdma")) {
+#ifdef HAVE_LIBRDMACM
+                        smb2->rdma = 1;
+#else
+                        smb2_set_error(smb2, "rdma: built without "
+                                       "librdmacm");
+                        return -1;
+#endif
                 } else {
                         smb2_set_error(smb2, "Unknown argument: %s", args);
                         return -1;
@@ -444,43 +459,67 @@ void smb2_destroy_context(struct smb2_context *smb2)
                 close(smb2->fd);
                 smb2->fd = SMB2_INVALID_SOCKET;
         }
+        smb2_quic_reset(smb2);
+        smb2_rdma_reset(smb2);
 
-        while (smb2->outqueue) {
-                struct smb2_pdu *pdu = smb2->outqueue;
+        /*
+         * Complete every PDU that is still queued with SMB2_STATUS_SHUTDOWN.
+         * A callback may queue another PDU (e.g. close a file when its read
+         * fails), so repeat until all the queues are empty.
+         */
+        while (smb2->outqueue || smb2->pdu || smb2->next_pdu ||
+               smb2->waitqueue) {
+                while (smb2->outqueue) {
+                        struct smb2_pdu *pdu = smb2->outqueue;
+                        struct smb2_pdu *p;
 
-                smb2->outqueue = pdu->next;
-                if (pdu->cb) {
-                        pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL, pdu->cb_data);
+                        smb2->outqueue = pdu->next;
+                        /*
+                         * An unsent compound is still chained: every PDU
+                         * in it has its own callback, and smb2_free_pdu()
+                         * frees the whole chain.
+                         */
+                        for (p = pdu; p; p = p->next_compound) {
+                                if (p->cb) {
+                                        p->cb(smb2, SMB2_STATUS_SHUTDOWN,
+                                              NULL, p->cb_data);
+                                }
+                        }
+                        smb2_free_pdu(smb2, pdu);
                 }
-                smb2_free_pdu(smb2, pdu);
-        }
-        if (smb2->pdu) {
-                struct smb2_pdu *pdu = smb2->pdu;
+                if (smb2->pdu) {
+                        struct smb2_pdu *pdu = smb2->pdu;
 
-                if (pdu->cb) {
-                        pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL, pdu->cb_data);
-                }
-                smb2_free_pdu(smb2, smb2->pdu);
-        }
-        if (smb2->next_pdu) {
-                struct smb2_pdu *pdu = smb2->next_pdu;
-
-                if (pdu->cb) {
-                        pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL, pdu->cb_data);
-                }
-                smb2_free_pdu(smb2, smb2->next_pdu);
-        }
-        while (smb2->waitqueue) {
-                struct smb2_pdu *pdu = smb2->waitqueue;
-
-                smb2->waitqueue = pdu->next;
-                if (pdu->cb) {
-                        pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL, pdu->cb_data);
-                }
-                if (pdu == smb2->pdu) {
                         smb2->pdu = NULL;
+                        if (pdu->cb) {
+                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
+                                        pdu->cb_data);
+                        }
+                        smb2_free_pdu(smb2, pdu);
                 }
-                smb2_free_pdu(smb2, pdu);
+                if (smb2->next_pdu) {
+                        struct smb2_pdu *pdu = smb2->next_pdu;
+
+                        smb2->next_pdu = NULL;
+                        if (pdu->cb) {
+                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
+                                        pdu->cb_data);
+                        }
+                        smb2_free_pdu(smb2, pdu);
+                }
+                while (smb2->waitqueue) {
+                        struct smb2_pdu *pdu = smb2->waitqueue;
+
+                        smb2->waitqueue = pdu->next;
+                        if (pdu->cb) {
+                                pdu->cb(smb2, SMB2_STATUS_SHUTDOWN, NULL,
+                                        pdu->cb_data);
+                        }
+                        if (pdu == smb2->pdu) {
+                                smb2->pdu = NULL;
+                        }
+                        smb2_free_pdu(smb2, pdu);
+                }
         }
         smb2_free_iovector(smb2, &smb2->in);
 
@@ -654,10 +693,30 @@ const char *smb2_get_server_guid(struct smb2_context *smb2)
 {
         return smb2->server_guid;
 }
+
+int smb2_get_application_key(struct smb2_context *smb2, uint8_t key[16])
+{
+        if (smb2->session_key == NULL || smb2->session_key_size == 0) {
+                smb2_set_error(smb2, "No session key");
+                return -EINVAL;
+        }
+        memcpy(key, smb2->application_key, SMB2_KEY_SIZE);
+        return 0;
+}
  
 uint16_t smb2_get_dialect(struct smb2_context *smb2)
 {
         return smb2->dialect;
+}
+
+int smb2_get_ndr(struct smb2_context *smb2)
+{
+        return smb2->ndr;
+}
+
+int smb2_get_endianness(struct smb2_context *smb2)
+{
+        return smb2->endianness;
 }
 
 void smb2_set_security_mode(struct smb2_context *smb2, uint16_t security_mode)
@@ -701,6 +760,32 @@ server_host_matches(const char *server, const char *name)
         }
 
         return strlen(name) == len && !strncmp(name, host, len);
+}
+
+/*
+ * Does the user field of an NTLM_USER_FILE line name this user ?
+ * Windows user names are case insensitive, so compare them that way.
+ */
+static int
+user_matches(const char *user, const char *name)
+{
+        if (user == NULL || name == NULL) {
+                return 0;
+        }
+        for (; *user && *name; user++, name++) {
+                char a = *user, b = *name;
+
+                if (a >= 'A' && a <= 'Z') {
+                        a += 'a' - 'A';
+                }
+                if (b >= 'A' && b <= 'Z') {
+                        b += 'a' - 'A';
+                }
+                if (a != b) {
+                        return 0;
+                }
+        }
+        return *user == *name;
 }
 #endif /* !defined(_XBOX) && !defined(_IOP) &&  ... */
 
@@ -777,6 +862,10 @@ void smb2_set_password_from_file(struct smb2_context *smb2)
                 }
                 *password++ = 0;
 
+                /* The line only holds the password of the user it names */
+                if (!user_matches(smb2->user, user)) {
+                        continue;
+                }
                 if (domain[0] && smb2->domain && !strcmp(smb2->domain, domain)) {
                         smb2_set_password(smb2, password);
                         fclose(fh);

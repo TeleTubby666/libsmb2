@@ -57,35 +57,42 @@ endif()
       option(BUILD_SHARED_LIBS "Build shared libraries" ON)
     endif()
       option(ENABLE_EXAMPLES "Build example programs" OFF)
+      # The utilities need a hosted POSIX system (poll.h, a full libc), so
+      # only build them by default there: not on Windows, the consoles or
+      # the embedded targets.
+      if(CMAKE_SYSTEM_NAME MATCHES "^(Linux|Darwin|.*BSD|DragonFly|SunOS|Solaris|Android)$"
+         AND NOT PS4 AND NOT PICO_BOARD)
+        set(ENABLE_UTILS_DEFAULT ON)
+      else()
+        set(ENABLE_UTILS_DEFAULT OFF)
+      endif()
+      option(ENABLE_UTILS "Build and install the utilities" ${ENABLE_UTILS_DEFAULT})
       option(ENABLE_LIBKRB5 "Enable libkrb5 support" ON)
       option(ENABLE_GSSAPI "Enable gssapi support" ON)
       list(APPEND CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/cmake/Modules)
   endif()
 
-  # Embedded platforms: libsmb2 only (share-enum NetrShareEnum 0/1/2).
-  # Full DCE/RPC is a separate library (libdcerpc) on full-size platforms.
-  # Windows: never build libdcerpc — its symbols collide with Microsoft RPC.
-  set(_SMB2_EMBEDDED_DCERPC FALSE)
-  if(ESP_PLATFORM OR PICO_BOARD OR IOP OR BUILD_IRX OR EE OR PS2 OR PS4 OR VITA)
-    set(_SMB2_EMBEDDED_DCERPC TRUE)
-  elseif(CMAKE_SYSTEM_NAME MATCHES "NintendoSwitch|Nintendo3DS|dreamcast|NintendoGameCube|NintendoDS|NintendoWii|CafeOS")
-    set(_SMB2_EMBEDDED_DCERPC TRUE)
-  endif()
-
-  if(_SMB2_EMBEDDED_DCERPC)
+  # Full DCE/RPC is a separate project (libdcerpc/) with its own version
+  # and releases. It is Linux only for now, and can never be built on
+  # Windows since its symbols collide with Microsoft RPC.
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ESP_PLATFORM OR PICO_BOARD OR IOP OR BUILD_IRX)
     set(ENABLE_LIBDCERPC OFF)
-    message(STATUS "Embedded platform: libsmb2 only (minimal DCE/RPC share enum)")
-  elseif(WIN32 OR CMAKE_SYSTEM_NAME MATCHES "Windows")
-    set(ENABLE_LIBDCERPC OFF)
-    message(STATUS "Windows: libdcerpc disabled (symbol collisions with Microsoft RPC)")
   else()
-    if(NOT ESP_PLATFORM)
-      option(ENABLE_LIBDCERPC "Build libdcerpc (full DCE/RPC; depends on libsmb2)" ON)
-    endif()
+    option(ENABLE_LIBDCERPC "Build libdcerpc (full DCE/RPC; depends on libsmb2)" ON)
     if(ENABLE_LIBDCERPC)
       message(STATUS "Build libdcerpc (full DCE/RPC interfaces)")
     else()
-      message(STATUS "libdcerpc disabled; libsmb2 keeps NetrShareEnum 0/1/2 only")
+      message(STATUS "libdcerpc disabled")
+    endif()
+
+    # Only libdcerpc's coders and server runtime, without libsmb2: for a
+    # project that has libsmb2 as a submodule to get at libdcerpc, such as
+    # ksmbd-tools through meson's cmake module.
+    option(LIBDCERPC_ONLY "Build only libdcerpc, without the libsmb2 transport" OFF)
+    if(LIBDCERPC_ONLY)
+      set(WITH_LIBSMB2 OFF CACHE BOOL "" FORCE)
+      add_subdirectory(libdcerpc)
+      return()
     endif()
   endif()
 
@@ -146,6 +153,44 @@ endif()
     endif()
   endif()
 
+  # SMB2 over QUIC (the "quic" URL argument) uses the Linux kernel QUIC module for
+  # the transport and libquic (on top of gnutls) for the TLS 1.3
+  # handshake, so it is Linux only. Built in when libquic is found.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT (ESP_PLATFORM OR PICO_BOARD OR IOP OR BUILD_IRX))
+    option(ENABLE_LIBQUIC "Enable SMB2 over QUIC (needs libquic)" ON)
+    if(ENABLE_LIBQUIC)
+      find_path(LIBQUIC_INCLUDE_DIR netinet/quic.h)
+      find_library(LIBQUIC_LIBRARY quic)
+      find_library(GNUTLS_LIBRARY gnutls)
+      if(LIBQUIC_INCLUDE_DIR AND LIBQUIC_LIBRARY AND GNUTLS_LIBRARY)
+        message(STATUS "Build with SMB2 over QUIC support")
+        set(HAVE_LIBQUIC 1)
+        list(APPEND core_DEPENDS ${LIBQUIC_LIBRARY} ${GNUTLS_LIBRARY})
+      else()
+        message(STATUS "libquic not found, building without SMB2 over QUIC")
+      endif()
+    endif()
+  endif()
+
+  # SMB2 over SMB Direct (the "rdma" URL argument) uses librdmacm and
+  # libibverbs from rdma-core, Linux only. Built in when they are found.
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT (ESP_PLATFORM OR PICO_BOARD OR IOP OR BUILD_IRX))
+    option(ENABLE_RDMA "Enable SMB Direct (needs librdmacm and libibverbs)" ON)
+    if(ENABLE_RDMA)
+      find_path(RDMACM_INCLUDE_DIR rdma/rdma_cma.h)
+      find_path(IBVERBS_INCLUDE_DIR infiniband/verbs.h)
+      find_library(RDMACM_LIBRARY rdmacm)
+      find_library(IBVERBS_LIBRARY ibverbs)
+      if(RDMACM_INCLUDE_DIR AND IBVERBS_INCLUDE_DIR AND RDMACM_LIBRARY AND IBVERBS_LIBRARY)
+        message(STATUS "Build with SMB Direct support")
+        set(HAVE_LIBRDMACM 1)
+        list(APPEND core_DEPENDS ${RDMACM_LIBRARY} ${IBVERBS_LIBRARY})
+      else()
+        message(STATUS "librdmacm/libibverbs not found, building without SMB Direct")
+      endif()
+    endif()
+  endif()
+
   if(NOT ESP_PLATFORM)
       include(cmake/ConfigureChecks.cmake)
   endif()
@@ -181,12 +226,6 @@ endif()
       file(WRITE ${DEF_FILE_PATH} "LIBRARY smb2\nEXPORTS\n\n${EXPORT_SYMBOLS}")
       # Pass def file to the linker
       set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} /DEF:${DEF_FILE_PATH}")
-      if(ENABLE_LIBDCERPC)
-        set(DCERPC_SYMS_FILE_PATH "${PROJECT_SOURCE_DIR}/libdcerpc/libdcerpc.syms")
-        set(DCERPC_DEF_FILE_PATH "${PROJECT_BINARY_DIR}/libdcerpc/libdcerpc.def")
-        file(READ ${DCERPC_SYMS_FILE_PATH} DCERPC_EXPORT_SYMBOLS)
-        file(WRITE ${DCERPC_DEF_FILE_PATH} "LIBRARY dcerpc\nEXPORTS\n\n${DCERPC_EXPORT_SYMBOLS}")
-      endif()
     endif()
 
     if(CMAKE_SYSTEM_NAME MATCHES Windows)
@@ -274,6 +313,10 @@ endif()
       add_subdirectory(examples)
     endif()
 
+    if(ENABLE_UTILS)
+      add_subdirectory(utils)
+    endif()
+
   # The packaging and install rules below need PROJECT_VERSION and the
   # INSTALL_* paths, and neither is set for the pico or the esp-idf build.
   if(NOT PICO_BOARD AND NOT ESP_PLATFORM)
@@ -284,17 +327,9 @@ endif()
     if(NOT IOP AND NOT BUILD_IRX)
       configure_file(cmake/libsmb2.pc.cmake
                   ${CMAKE_CURRENT_BINARY_DIR}/libsmb2.pc @ONLY)
-      if(ENABLE_LIBDCERPC)
-        configure_file(cmake/libdcerpc.pc.cmake
-                    ${CMAKE_CURRENT_BINARY_DIR}/libdcerpc.pc @ONLY)
-      endif()
 
       install(DIRECTORY include/smb2
             DESTINATION ${INSTALL_INC_DIR})
-      if(ENABLE_LIBDCERPC)
-        install(DIRECTORY include/dcerpc
-              DESTINATION ${INSTALL_INC_DIR})
-      endif()
 
       install(FILES cmake/FindSMB2.cmake
                   ${CMAKE_CURRENT_BINARY_DIR}/libsmb2-config-version.cmake
@@ -302,10 +337,6 @@ endif()
 
       install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libsmb2.pc
             DESTINATION ${INSTALL_PKGCONFIG_DIR})
-      if(ENABLE_LIBDCERPC)
-        install(FILES ${CMAKE_CURRENT_BINARY_DIR}/libdcerpc.pc
-              DESTINATION ${INSTALL_PKGCONFIG_DIR})
-      endif()
     endif()
   endif() 
 

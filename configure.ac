@@ -25,10 +25,6 @@ AC_ARG_ENABLE([examples],
 AM_CONDITIONAL([ENABLE_EXAMPLES],
                [test "$enable_examples" = "yes"])
 
-dnl  Full DCE/RPC is built as a separate library (libdcerpc) that depends on
-dnl  libsmb2 for transport. libsmb2 keeps only NetrShareEnum levels 0/1/2
-dnl  with libsmb2_-prefixed internal symbols.
-
 AC_ARG_WITH([libkrb5],
             [AS_HELP_STRING([--without-libkrb5],
                             [Do not link with libkrb5 and use builtin
@@ -121,13 +117,94 @@ case $host in
     ;;
 esac
 AM_CONDITIONAL([HAVE_WIN32], [test "${SYS}" = "mingw32"])
-dnl  libdcerpc symbols collide with Microsoft RPC; never build it on Windows.
-AM_CONDITIONAL([BUILD_LIBDCERPC], [test "${SYS}" != "mingw32"])
-AS_IF([test "${SYS}" = "mingw32"], [
-    AC_MSG_NOTICE([Windows: libdcerpc disabled (symbol collisions with Microsoft RPC)])
-], [
+dnl  libdcerpc (full DCE/RPC) is a separate project in the libdcerpc/
+dnl  subdirectory with its own configure, version and releases. It is
+dnl  Linux only for now, and can never be built on Windows since its
+dnl  symbols collide with Microsoft RPC. When enabled, it is configured
+dnl  against this uninstalled libsmb2.
+AC_ARG_ENABLE([libdcerpc],
+              [AS_HELP_STRING([--disable-libdcerpc],
+                              [Do not build libdcerpc (Linux only)])])
+
+case $host in
+  *linux*)
+    ;;
+  *)
+    AS_IF([test "x$enable_libdcerpc" = "xyes"], [
+        AC_MSG_ERROR([libdcerpc is only supported on Linux])
+    ])
+    enable_libdcerpc=no
+    ;;
+esac
+AS_IF([test "x$enable_libdcerpc" != "xno"], [
     AC_MSG_NOTICE([Build libdcerpc (full DCE/RPC interfaces)])
+    smb2_abs_srcdir=`cd "$srcdir" && pwd`
+    ac_configure_args="$ac_configure_args 'LIBSMB2_CFLAGS=-I$smb2_abs_srcdir/include' 'LIBSMB2_LIBS=$ac_pwd/lib/libsmb2.la'"
+    AC_CONFIG_SUBDIRS([libdcerpc])
+], [
+    AC_MSG_NOTICE([libdcerpc disabled])
 ])
+AM_CONDITIONAL([BUILD_LIBDCERPC], [test "x$enable_libdcerpc" != "xno"])
+
+dnl  SMB2 over QUIC (the "quic" URL argument) uses the Linux kernel QUIC module
+dnl  for the transport and libquic (on top of gnutls) for the TLS 1.3
+dnl  handshake, so it is Linux only. Built in when libquic is found.
+AC_ARG_WITH([libquic],
+            [AS_HELP_STRING([--without-libquic],
+                            [Do not build SMB2 over QUIC support (Linux only)])])
+MAYBE_LIBQUIC=""
+case $host in
+  *linux*)
+    AS_IF([test "x$with_libquic" != "xno"], [
+        AC_CHECK_HEADER([netinet/quic.h], [
+            AC_CHECK_LIB([quic], [quic_handshake_step], [
+                AC_DEFINE([HAVE_LIBQUIC], [1], [Whether we have libquic for SMB2 over QUIC])
+                MAYBE_LIBQUIC="-lquic -lgnutls"
+            ], [], [-lgnutls])
+        ])
+    ])
+    ;;
+esac
+AS_IF([test "x$with_libquic" = "xyes" && test "x$MAYBE_LIBQUIC" = "x"], [
+    AC_MSG_ERROR([libquic not found, or not on Linux])
+])
+AS_IF([test "x$MAYBE_LIBQUIC" != "x"], [
+    AC_MSG_NOTICE([Build with SMB2 over QUIC support])
+], [
+    AC_MSG_NOTICE([Build WITHOUT SMB2 over QUIC support])
+])
+AC_SUBST([MAYBE_LIBQUIC])
+
+dnl  SMB2 over SMB Direct (the "rdma" URL argument) uses librdmacm and
+dnl  libibverbs from rdma-core, Linux only. Built in when they are found.
+AC_ARG_WITH([librdmacm],
+            [AS_HELP_STRING([--without-librdmacm],
+                            [Do not build SMB Direct (RDMA) support (Linux only)])])
+MAYBE_LIBRDMACM=""
+case $host in
+  *linux*)
+    AS_IF([test "x$with_librdmacm" != "xno"], [
+        AC_CHECK_HEADERS([rdma/rdma_cma.h infiniband/verbs.h], [], [have_rdma_headers=no])
+        AS_IF([test "x$have_rdma_headers" != "xno"], [
+            AC_CHECK_LIB([rdmacm], [rdma_create_id], [
+                AC_CHECK_LIB([ibverbs], [ibv_alloc_pd], [
+                    AC_DEFINE([HAVE_LIBRDMACM], [1], [Whether we have librdmacm for SMB Direct])
+                    MAYBE_LIBRDMACM="-lrdmacm -libverbs"
+                ])
+            ])
+        ])
+    ])
+    ;;
+esac
+AS_IF([test "x$with_librdmacm" = "xyes" && test "x$MAYBE_LIBRDMACM" = "x"], [
+    AC_MSG_ERROR([librdmacm/libibverbs not found, or not on Linux])
+])
+AS_IF([test "x$MAYBE_LIBRDMACM" != "x"], [
+    AC_MSG_NOTICE([Build with SMB Direct support])
+], [
+    AC_MSG_NOTICE([Build WITHOUT SMB Direct support])
+])
+AC_SUBST([MAYBE_LIBRDMACM])
 AC_SUBST([LIBSOCKET])
 
 AC_CHECK_LIB([dl], [dlsym], [], [AC_MSG_ERROR([dlsym not found, libdl is required])])
@@ -246,10 +323,9 @@ AC_CONFIG_FILES([
     examples/Makefile
     include/Makefile
     lib/Makefile
-    libdcerpc/Makefile
     tests/Makefile
     utils/Makefile
 ])
 
-AC_CONFIG_FILES([libsmb2.pc libdcerpc.pc])
+AC_CONFIG_FILES([libsmb2.pc])
 AC_OUTPUT

@@ -117,6 +117,12 @@ smb2_allocate_pdu(struct smb2_context *smb2, enum smb2_command command,
                  * looking at traces.
                  */
                 hdr->credit_charge = 0;
+        } else if (hdr->command == SMB2_CANCEL) {
+                /* CANCEL reuses the MessageId (or AsyncId) of the request
+                 * it cancels instead of consuming a new one, so it must
+                 * not charge any credits of its own.
+                 */
+                hdr->credit_charge = 0;
         } else {
                 /* Assume the credits for this PDU will be 1.
                  * READ/WRITE/IOCTL/QUERYDIR that consumes more than
@@ -132,7 +138,7 @@ smb2_allocate_pdu(struct smb2_context *smb2, enum smb2_command command,
         case SMB2_SESSION_SETUP:
         case SMB2_LOGOFF:
         case SMB2_ECHO:
-        /* case SMB2_CANCEL: */
+        case SMB2_CANCEL:
                 hdr->sync.tree_id = 0;
                 break;
         case SMB2_TREE_CONNECT:
@@ -211,7 +217,7 @@ smb2_get_tree_id_for_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu, uint32
                 case SMB2_SESSION_SETUP:
                 case SMB2_LOGOFF:
                 case SMB2_ECHO:
-                /* case SMB2_CANCEL: */
+                case SMB2_CANCEL:
                 case SMB2_TREE_CONNECT:
                         *tree_id  = 0;
                         return 0;
@@ -243,7 +249,7 @@ smb2_set_tree_id_for_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu, uint32
                 case SMB2_SESSION_SETUP:
                 case SMB2_LOGOFF:
                 case SMB2_ECHO:
-                /* case SMB2_CANCEL: */
+                case SMB2_CANCEL:
                         break;
                 case SMB2_TREE_CONNECT:
                         break;
@@ -315,9 +321,10 @@ smb2_pdu_is_compound(struct smb2_context *smb2)
                 (smb2->hdr.next_command != 0) : 0;
 }
 
-void
-smb2_add_compound_pdu(struct smb2_context *smb2,
-                      struct smb2_pdu *pdu, struct smb2_pdu *next_pdu)
+static void
+_smb2_add_compound_pdu(struct smb2_context *smb2,
+                       struct smb2_pdu *pdu, struct smb2_pdu *next_pdu,
+                       int is_related)
 {
         int i, offset;
 
@@ -335,9 +342,47 @@ smb2_add_compound_pdu(struct smb2_context *smb2,
         pdu->header.next_command = offset;
         smb2_set_uint32(&pdu->out.iov[0], 20, pdu->header.next_command);
 
-        /* Fixup flags */
-        next_pdu->header.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+        if (is_related) {
+                /* Fixup flags */
+                next_pdu->header.flags |= SMB2_FLAGS_RELATED_OPERATIONS;
+        } else {
+                /*
+                 * This is an UNRELATED compound.
+                 * Do NOT set SMB2_FLAGS_RELATED_OPERATIONS.
+                 *
+                 * Only touch next_pdu here, never pdu (the last pdu of
+                 * whatever chain we are appending to): pdu may already
+                 * be legitimately related to its own predecessor from
+                 * an earlier smb2_add_compound_pdu() call, and clearing
+                 * that would corrupt the FileId that relatedness was
+                 * supposed to resolve, turning a compound_file_id
+                 * placeholder into a bogus literal FileId.
+                 */
+                next_pdu->header.flags &= ~SMB2_FLAGS_RELATED_OPERATIONS;
+
+                /*
+                 * Mark the new pdu so the receive path knows not to
+                 * enforce compound ordering against whatever came
+                 * before it.
+                 */
+                next_pdu->unrelated_compound = 1;
+        }
         smb2_set_uint32(&next_pdu->out.iov[0], 16, next_pdu->header.flags);
+}
+
+void
+smb2_add_compound_pdu(struct smb2_context *smb2,
+                      struct smb2_pdu *pdu, struct smb2_pdu *next_pdu)
+{
+        _smb2_add_compound_pdu(smb2, pdu, next_pdu, 1);
+}
+
+void
+smb2_add_unrelated_compound_pdu(struct smb2_context *smb2,
+                                struct smb2_pdu *pdu,
+                                struct smb2_pdu *next_pdu)
+{
+        _smb2_add_compound_pdu(smb2, pdu, next_pdu, 0);
 }
 
 void
@@ -460,7 +505,7 @@ static void
 smb2_encode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                    struct smb2_header *hdr)
 {
-        if (!smb2_is_server(smb2)) {
+        if (!smb2_is_server(smb2) && hdr->command != SMB2_CANCEL) {
                 hdr->message_id = smb2->message_id++;
                 if (hdr->credit_charge > 1) {
                         smb2->message_id += (hdr->credit_charge - 1);
@@ -548,7 +593,7 @@ smb2_decode_header(struct smb2_context *smb2, struct smb2_iovec *iov,
                         case SMB2_SESSION_SETUP:
                         case SMB2_LOGOFF:
                         case SMB2_ECHO:
-                        /* case SMB2_CANCEL: */
+                        case SMB2_CANCEL:
                                 break;
                         case SMB2_TREE_CONNECT:
                                 break;
@@ -693,8 +738,18 @@ smb2_queue_pdu(struct smb2_context *smb2, struct smb2_pdu *pdu)
                         /*
                          * Track the mid of the previous command in the chain
                          * so we can enforce ordering on receive.
+                         *
+                         * Related compounds require replies to be processed
+                         * in order.
+                         *
+                         * Unrelated compounds do not have this dependency.
                          */
-                        p->prev_compound_mid = prev_compound_mid;
+                        if (p->unrelated_compound) {
+                                p->prev_compound_mid = 0;
+                        } else {
+                                p->prev_compound_mid = prev_compound_mid;
+                        }
+
                         prev_compound_mid = p->header.message_id;
                 }
 

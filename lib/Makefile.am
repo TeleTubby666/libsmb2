@@ -2,11 +2,8 @@ AM_CFLAGS=$(WARN_CFLAGS)
 
 lib_LTLIBRARIES = libsmb2.la
 
-# -I$(abs_top_srcdir)/libdcerpc so libsmb2-dcerpc*.c can #include "dcerpc.c"
-# via relative path; private headers stay under lib/.
 libsmb2_la_CPPFLAGS = -I$(abs_top_srcdir)/include \
 		      -I$(abs_top_srcdir)/include/smb2 \
-		      -I$(abs_top_srcdir)/libdcerpc \
 		      "-D_U_=__attribute__((unused))"
 
 libsmb2_la_SOURCES = \
@@ -20,8 +17,6 @@ libsmb2_la_SOURCES = \
 	asn1-ber.c \
 	compat.c \
 	compat.h \
-	libsmb2-dcerpc.c \
-	libsmb2-dcerpc-srvsvc.c \
 	errors.c \
 	init.c \
 	hmac.c \
@@ -37,11 +32,14 @@ libsmb2_la_SOURCES = \
 	ntlmssp.h \
 	ntlmssp.c \
 	pdu.c \
+	quic.c \
+	smbdirect.c \
 	sha.h \
 	sha-private.h \
 	sha1.c \
 	sha224-256.c \
 	sha384-512.c \
+	smb2-cmd-cancel.c \
 	smb2-cmd-close.c \
 	smb2-cmd-create.c \
 	smb2-cmd-echo.c \
@@ -83,9 +81,8 @@ SOAGE=0
 
 libsmb2_la_LDFLAGS = \
 	-version-info $(SOCURRENT):$(SOREVISION):$(SOAGE) -bindir $(bindir) \
-	-no-undefined -export-symbols $(srcdir)/libsmb2.syms $(MAYBE_LIBKRB5)
+	-no-undefined -export-symbols $(srcdir)/libsmb2.syms $(MAYBE_LIBKRB5) \
+	$(MAYBE_LIBQUIC) $(MAYBE_LIBRDMACM)
 libsmb2_la_DEPENDENCIES = $(srcdir)/libsmb2.syms
 
-# dcerpc.c / dcerpc-srvsvc.c live in ../libdcerpc and are pulled in via
-# libsmb2-dcerpc*.c wrappers (with libsmb2_ symbol prefix).
-dist_noinst_DATA = libsmb2.syms libsmb2-dcerpc-prefix.h
+dist_noinst_DATA = libsmb2.syms

@@ -44,375 +44,12 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
 #include <errno.h>
 #include <stdio.h>
 
-#include "compat.h"
 
-#include "smb2.h"
-#include "libsmb2.h"
 #include <dcerpc/dcerpc.h>
 #include <dcerpc/dcerpc-dtyp.h>
-#include "libsmb2-raw.h"
-#include "libsmb2-private.h"
+#include "dcerpc-private.h"
 
 unsigned char NT_SID_AUTHORITY[6] = { 0x00, 0x00, 0x00, 0x00, 0x00, 0x05 };
-
-/*
- * typedef struct _RPC_SID {
- *      unsigned char Revision;
- *      unsigned char SubAuthorityCount;
- *      byte IdentifierAuthority[6];
- *      [size_is(SubAuthorityCount)] uint32_t SubAuthority[];
- * } RPC_SID, *PRPC_SID, *PSID;
- */
-static int
-ndr_sid_coder(char *name, struct dcerpc_context *dce,
-              struct dcerpc_pdu *pdu,
-              struct dcerpc_iovec *iov, int *offset,
-              void *ptr)
-{
-        RPC_SID *sid = ptr;
-        uint64_t count;
-        int i;
-
-        count = sid->SubAuthorityCount;
-        if (ndr_uint3264_coder("", dce, pdu, iov, offset, &count)) {
-                return -1;
-        }
-        if (count > MAXSUBAUTH) {
-                return -1;
-        }
-
-        if (ndr_uint8_coder("Revision", dce, pdu, iov, offset, &sid->Revision)) {
-                return -1;
-        }
-        if (ndr_uint8_coder("SubAuthorityCount", dce, pdu, iov, offset, &sid->SubAuthorityCount)) {
-                return -1;
-        }
-        if (sid->SubAuthorityCount != count) {
-                return -1;
-        }
-        for (i = 0; i < 6; i++) {
-                if (ndr_uint8_coder("IdentifierAuthority", dce, pdu, iov, offset, &sid->IdentifierAuthority[i])) {
-                        return -1;
-                }
-        }
-        for (i = 0; i < count; i++) {
-                if (ndr_uint32_coder("Subauthority", dce, pdu, iov, offset, &sid->SubAuthority[i])) {
-                        return -1;
-                }
-        }
-
-        return 0;
-}
-
-/*
- * YAML representation of an RPC_SID is the standard SID string form:
- *   S-<revision>-<identifier-authority>-<subauth0>-<subauth1>-...
- * e.g. S-1-5-32-544
- *
- * Identifier authority is a big-endian 48-bit value. If it fits in 32 bits
- * it is written in decimal; otherwise as a 0x-prefixed hex value (Windows
- * ConvertSidToStringSid rules).
- */
-static int
-yaml_sid_coder(char *name, struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-               struct dcerpc_iovec *iov, int *offset, void *ptr)
-{
-        RPC_SID *sid = ptr;
-        int i;
-
-        if (dcerpc_pdu_direction(pdu) == DCERPC_DECODE) {
-                const char *p;
-                char *end;
-                unsigned long rev;
-                unsigned long long ia;
-                uint32_t sub[MAXSUBAUTH];
-                int count = 0;
-
-                yaml_next_kv(pdu, iov, offset);
-                if (strcmp(dcerpc_pdu_yaml_key(pdu), name)) {
-                        printf("Wrong YAML key encountered for sid. Expected %s but got %s\n",
-                               name, dcerpc_pdu_yaml_key(pdu));
-                        return -1;
-                }
-                dcerpc_pdu_clear_yaml_key(pdu);
-
-                p = dcerpc_pdu_yaml_val(pdu);
-                if (p == NULL || (p[0] != 'S' && p[0] != 's') || p[1] != '-') {
-                        printf("Failed to parse SID value for %s: %s\n",
-                               name, dcerpc_pdu_yaml_val(pdu) ?
-                               dcerpc_pdu_yaml_val(pdu) : "(null)");
-                        return -1;
-                }
-                p += 2;
-
-                rev = strtoul(p, &end, 10);
-                if (end == p || *end != '-' || rev > 255) {
-                        printf("Failed to parse SID revision for %s: %s\n",
-                               name, dcerpc_pdu_yaml_val(pdu));
-                        return -1;
-                }
-                p = end + 1;
-
-                if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-                        ia = strtoull(p, &end, 16);
-                } else {
-                        ia = strtoull(p, &end, 10);
-                }
-                if (end == p) {
-                        printf("Failed to parse SID authority for %s: %s\n",
-                               name, dcerpc_pdu_yaml_val(pdu));
-                        return -1;
-                }
-                p = end;
-
-                while (*p == '-') {
-                        unsigned long sa;
-
-                        p++;
-                        if (count >= MAXSUBAUTH) {
-                                printf("Too many SID subauthorities for %s: %s\n",
-                                       name, dcerpc_pdu_yaml_val(pdu));
-                                return -1;
-                        }
-                        sa = strtoul(p, &end, 10);
-                        if (end == p) {
-                                printf("Failed to parse SID subauthority for %s: %s\n",
-                                       name, dcerpc_pdu_yaml_val(pdu));
-                                return -1;
-                        }
-                        sub[count++] = (uint32_t)sa;
-                        p = end;
-                }
-                if (*p != '\0') {
-                        printf("Failed to parse SID value for %s: %s\n",
-                               name, dcerpc_pdu_yaml_val(pdu));
-                        return -1;
-                }
-
-                sid->Revision = (uint8_t)rev;
-                sid->SubAuthorityCount = (uint8_t)count;
-                for (i = 0; i < 6; i++) {
-                        sid->IdentifierAuthority[i] =
-                                (uint8_t)((ia >> (8 * (5 - i))) & 0xff);
-                }
-                for (i = 0; i < count; i++) {
-                        sid->SubAuthority[i] = sub[i];
-                }
-
-                yaml_next_kv(pdu, iov, offset);
-                return 0;
-        } else {
-                uint64_t ia = 0;
-                char sidstr[256];
-                int len;
-
-                for (i = 0; i < 6; i++) {
-                        ia = (ia << 8) | sid->IdentifierAuthority[i];
-                }
-
-                if (ia <= 0xffffffffULL) {
-                        len = snprintf(sidstr, sizeof(sidstr),
-                                       "S-%u-%llu",
-                                       sid->Revision,
-                                       (unsigned long long)ia);
-                } else {
-                        len = snprintf(sidstr, sizeof(sidstr),
-                                       "S-%u-0x%llx",
-                                       sid->Revision,
-                                       (unsigned long long)ia);
-                }
-                if (len < 0 || (size_t)len >= sizeof(sidstr)) {
-                        printf("Failed to format SID for %s\n", name);
-                        return -1;
-                }
-                for (i = 0; i < sid->SubAuthorityCount; i++) {
-                        int n;
-
-                        n = snprintf(sidstr + len, sizeof(sidstr) - (size_t)len,
-                                     "-%u", sid->SubAuthority[i]);
-                        if (n < 0 ||
-                            (size_t)len + (size_t)n >= sizeof(sidstr)) {
-                                printf("Failed to format SID for %s\n", name);
-                                return -1;
-                        }
-                        len += n;
-                }
-
-                yaml_print_preamble(dce, pdu, iov, offset);
-                if (*offset + 256 < iov->len) {
-                        *offset += snprintf((char *)&iov->buf[*offset],
-                                           iov->len - *offset,
-                                           "%s: %s\n", name, sidstr);
-                }
-                return 0;
-        }
-}
-
-/*
- * JSON representation of an RPC_SID is the standard SID string form,
- * same as YAML: S-<revision>-<authority>-<subauth>...
- */
-static int
-json_sid_coder(char *name, struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-               struct dcerpc_iovec *iov, int *offset, void *ptr)
-{
-        RPC_SID *sid = ptr;
-        int i;
-
-        if (dcerpc_pdu_direction(pdu) == DCERPC_DECODE) {
-                const char *p;
-                char *end;
-                char *val;
-                unsigned long rev;
-                unsigned long long ia;
-                uint32_t sub[MAXSUBAUTH];
-                int count = 0;
-
-                if (json_expect_key(pdu, iov, offset, name) < 0) {
-                        return -1;
-                }
-                if (json_parse_string(iov, offset, &val) < 0) {
-                        return -1;
-                }
-
-                p = val;
-                if (p == NULL || (p[0] != 'S' && p[0] != 's') || p[1] != '-') {
-                        printf("Failed to parse SID value for %s: %s\n",
-                               name, val ? val : "(null)");
-                        return -1;
-                }
-                p += 2;
-
-                rev = strtoul(p, &end, 10);
-                if (end == p || *end != '-' || rev > 255) {
-                        printf("Failed to parse SID revision for %s: %s\n",
-                               name, val);
-                        return -1;
-                }
-                p = end + 1;
-
-                if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
-                        ia = strtoull(p, &end, 16);
-                } else {
-                        ia = strtoull(p, &end, 10);
-                }
-                if (end == p) {
-                        printf("Failed to parse SID authority for %s: %s\n",
-                               name, val);
-                        return -1;
-                }
-                p = end;
-
-                while (*p == '-') {
-                        unsigned long sa;
-
-                        p++;
-                        if (count >= MAXSUBAUTH) {
-                                printf("Too many SID subauthorities for %s: %s\n",
-                                       name, val);
-                                return -1;
-                        }
-                        sa = strtoul(p, &end, 10);
-                        if (end == p) {
-                                printf("Failed to parse SID subauthority for %s: %s\n",
-                                       name, val);
-                                return -1;
-                        }
-                        sub[count++] = (uint32_t)sa;
-                        p = end;
-                }
-                if (*p != '\0') {
-                        printf("Failed to parse SID value for %s: %s\n",
-                               name, val);
-                        return -1;
-                }
-
-                sid->Revision = (uint8_t)rev;
-                sid->SubAuthorityCount = (uint8_t)count;
-                for (i = 0; i < 6; i++) {
-                        sid->IdentifierAuthority[i] =
-                                (uint8_t)((ia >> (8 * (5 - i))) & 0xff);
-                }
-                for (i = 0; i < count; i++) {
-                        sid->SubAuthority[i] = sub[i];
-                }
-                return 0;
-        } else {
-                uint64_t ia = 0;
-                char sidstr[256];
-                int len;
-
-                for (i = 0; i < 6; i++) {
-                        ia = (ia << 8) | sid->IdentifierAuthority[i];
-                }
-
-                if (ia <= 0xffffffffULL) {
-                        len = snprintf(sidstr, sizeof(sidstr),
-                                       "S-%u-%llu",
-                                       sid->Revision,
-                                       (unsigned long long)ia);
-                } else {
-                        len = snprintf(sidstr, sizeof(sidstr),
-                                       "S-%u-0x%llx",
-                                       sid->Revision,
-                                       (unsigned long long)ia);
-                }
-                if (len < 0 || (size_t)len >= sizeof(sidstr)) {
-                        printf("Failed to format SID for %s\n", name);
-                        return -1;
-                }
-                for (i = 0; i < sid->SubAuthorityCount; i++) {
-                        int n;
-
-                        n = snprintf(sidstr + len, sizeof(sidstr) - (size_t)len,
-                                     "-%u", sid->SubAuthority[i]);
-                        if (n < 0 ||
-                            (size_t)len + (size_t)n >= sizeof(sidstr)) {
-                                printf("Failed to format SID for %s\n", name);
-                                return -1;
-                        }
-                        len += n;
-                }
-
-                json_sep(pdu, iov, offset);
-                if (json_append_quoted(iov, offset, name) < 0) {
-                        return -1;
-                }
-                if (json_append(iov, offset, ": ") < 0) {
-                        return -1;
-                }
-                if (json_append_quoted(iov, offset, sidstr) < 0) {
-                        return -1;
-                }
-                return 0;
-        }
-}
-
-int
-dcerpc_sid_coder(char *name, struct dcerpc_context *dce,
-                 struct dcerpc_pdu *pdu,
-                 struct dcerpc_iovec *iov, int *offset,
-                 void *ptr)
-{
-        switch (dcerpc_pdu_encoding(pdu)) {
-        case ENCODING_NDR:
-                if (ndr_sid_coder(name, dce, pdu, iov, offset, ptr)) {
-                        return -1;
-                }
-                return 0;
-        case ENCODING_YAML:
-                if (yaml_sid_coder(name, dce, pdu, iov, offset, ptr)) {
-                        return -1;
-                }
-                return 0;
-        case ENCODING_JSON:
-                if (json_sid_coder(name, dce, pdu, iov, offset, ptr)) {
-                        return -1;
-                }
-                return 0;
-        }
-        return 0;
-}
 
 /*
  * MS-DTYP 2.4.4.1 ACE_HEADER
@@ -422,6 +59,11 @@ dcerpc_sid_coder(char *name, struct dcerpc_context *dce,
  *     UCHAR AceFlags;
  *     USHORT AceSize;
  * } ACE_HEADER, *PACE_HEADER;
+ *
+ * The packet form (2.4.4.1) and the RPC representation (2.4.4.1.1) have
+ * the same layout. dcerpc_ACE_HEADER_coder() on its own is the RPC
+ * representation and follows the PDU byte order; inside an ACE it is
+ * coded within the ACE's packet-form scope and is always little-endian.
  */
 
 /* AceType is an exclusive enum (mask 0xffffffff matches a single value). */
@@ -501,7 +143,7 @@ static struct dcerpc_uint32_pretty_printer ace_flags_pp = {
 static int
 dcerpc_uint8_pp_coder(char *name, struct dcerpc_context *dce,
                       struct dcerpc_pdu *pdu,
-                      struct dcerpc_iovec *iov, int *offset,
+                      struct dcerpc_iovec *iov,
                       void *ptr,
                       struct dcerpc_uint32_pretty_printer *pp)
 {
@@ -509,13 +151,13 @@ dcerpc_uint8_pp_coder(char *name, struct dcerpc_context *dce,
         uint32_t tmp = 0;
 
         if (dcerpc_pdu_encoding(pdu) == ENCODING_NDR) {
-                return ndr_uint8_coder(name, dce, pdu, iov, offset, v);
+                return ndr_uint8_coder(name, dce, pdu, iov, v);
         }
 
         if (dcerpc_pdu_direction(pdu) == DCERPC_ENCODE) {
                 tmp = *v;
         }
-        if (dcerpc_uint32_coder_pp(name, dce, pdu, iov, offset, &tmp, pp)) {
+        if (dcerpc_uint32_coder_pp(name, dce, pdu, iov, &tmp, pp)) {
                 return -1;
         }
         if (dcerpc_pdu_direction(pdu) == DCERPC_DECODE) {
@@ -530,16 +172,16 @@ dcerpc_uint8_pp_coder(char *name, struct dcerpc_context *dce,
 static int
 ace_header_fields_coder(char *name, struct dcerpc_context *dce,
                         struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset,
+                        struct dcerpc_iovec *iov,
                         void *ptr)
 {
         ACE_HEADER *hdr = ptr;
 
-        if (dcerpc_uint8_pp_coder("AceType", dce, pdu, iov, offset,
+        if (dcerpc_uint8_pp_coder("AceType", dce, pdu, iov,
                                   &hdr->AceType, &ace_type_pp)) {
                 return -1;
         }
-        if (dcerpc_uint8_pp_coder("AceFlags", dce, pdu, iov, offset,
+        if (dcerpc_uint8_pp_coder("AceFlags", dce, pdu, iov,
                                   &hdr->AceFlags, &ace_flags_pp)) {
                 return -1;
         }
@@ -549,7 +191,7 @@ ace_header_fields_coder(char *name, struct dcerpc_context *dce,
          * NDR still reads/writes it as required by MS-DTYP 2.4.4.1.
          */
         if (dcerpc_pdu_encoding(pdu) == ENCODING_NDR) {
-                if (dcerpc_uint16_coder("AceSize", dce, pdu, iov, offset,
+                if (dcerpc_uint16_coder("AceSize", dce, pdu, iov,
                                         &hdr->AceSize)) {
                         return -1;
                 }
@@ -560,10 +202,10 @@ ace_header_fields_coder(char *name, struct dcerpc_context *dce,
 int
 dcerpc_ACE_HEADER_coder(char *name, struct dcerpc_context *dce,
                         struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset,
+                        struct dcerpc_iovec *iov,
                         void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
+        return dcerpc_struct_coder(name, dce, pdu, iov, ptr,
                                    ace_header_fields_coder);
 }
 
@@ -604,28 +246,30 @@ static struct dcerpc_uint32_pretty_printer access_mask_pp = {
 /*
  * Packet SID (MS-DTYP 2.4.2.2) as used inside ACEs / ACLs / security
  * descriptors. Unlike RPC_SID there is no leading size_is count.
+ * Also used as the body of RPC_SID by ndr_sid_coder; byte order follows
+ * the caller: little-endian inside a packet-form scope, the PDU data
+ * representation for RPC_SID.
  */
 static int
 ndr_packet_sid_coder(char *name, struct dcerpc_context *dce,
                      struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset,
+                     struct dcerpc_iovec *iov,
                      void *ptr)
 {
         RPC_SID *sid = ptr;
         uint8_t count;
         int i;
 
-        if (ndr_uint8_coder("Revision", dce, pdu, iov, offset,
+        if (ndr_uint8_coder("Revision", dce, pdu, iov,
                             &sid->Revision)) {
                 return -1;
         }
-        if (ndr_uint8_coder("SubAuthorityCount", dce, pdu, iov, offset,
+        if (ndr_uint8_coder("SubAuthorityCount", dce, pdu, iov,
                             &sid->SubAuthorityCount)) {
                 return -1;
         }
         for (i = 0; i < 6; i++) {
-                if (ndr_uint8_coder("IdentifierAuthority", dce, pdu, iov,
-                                    offset, &sid->IdentifierAuthority[i])) {
+                if (ndr_uint8_coder("IdentifierAuthority", dce, pdu, iov, &sid->IdentifierAuthority[i])) {
                         return -1;
                 }
         }
@@ -633,14 +277,15 @@ ndr_packet_sid_coder(char *name, struct dcerpc_context *dce,
         /*
          * During the conformance run SubAuthorityCount is not updated on
          * decode; use the in-memory count (encode) or 0 (fresh decode).
-         * Alignment is already raised by Mask (uint32) in the ACE.
+         * Alignment is already raised by the preceding field: Mask (uint32)
+         * in an ACE, or the conformance count in an RPC_SID.
          */
         count = sid->SubAuthorityCount;
         if (count > MAXSUBAUTH) {
                 return -1;
         }
         for (i = 0; i < count; i++) {
-                if (ndr_uint32_coder("SubAuthority", dce, pdu, iov, offset,
+                if (ndr_uint32_coder("SubAuthority", dce, pdu, iov,
                                      &sid->SubAuthority[i])) {
                         return -1;
                 }
@@ -649,23 +294,221 @@ ndr_packet_sid_coder(char *name, struct dcerpc_context *dce,
 }
 
 /*
+ * typedef struct _RPC_SID {
+ *      unsigned char Revision;
+ *      unsigned char SubAuthorityCount;
+ *      byte IdentifierAuthority[6];
+ *      [size_is(SubAuthorityCount)] uint32_t SubAuthority[];
+ * } RPC_SID, *PRPC_SID, *PSID;
+ *
+ * RPC_SID (MS-DTYP 2.4.2.3) is on the wire the 2.4.2.2 packet SID
+ * preceded by the NDR conformance count for SubAuthority[]. The
+ * conformance count must match SubAuthorityCount.
+ */
+int
+ndr_sid_coder(char *name, struct dcerpc_context *ctx, struct dcerpc_pdu *pdu,
+              struct dcerpc_iovec *iov, void *ptr)
+{
+        RPC_SID *sid = ptr;
+        uint64_t count;
+
+        count = sid->SubAuthorityCount;
+        if (ndr_uint3264_coder("", ctx, pdu, iov, &count)) {
+                return -1;
+        }
+        if (count > MAXSUBAUTH) {
+                return -1;
+        }
+        if (ndr_packet_sid_coder(name, ctx, pdu, iov, ptr)) {
+                return -1;
+        }
+        if (sid->SubAuthorityCount != count) {
+                return -1;
+        }
+
+        return 0;
+}
+
+/*
+ * Text (YAML/JSON) representation of an RPC_SID is the standard SID
+ * string form:
+ *   S-<revision>-<identifier-authority>-<subauth0>-<subauth1>-...
+ * e.g. S-1-5-32-544
+ *
+ * Identifier authority is a big-endian 48-bit value. If it fits in 32 bits
+ * it is written in decimal; otherwise as a 0x-prefixed hex value (Windows
+ * ConvertSidToStringSid rules).
+ */
+static int
+sid_from_string(char *name, const char *str, RPC_SID *sid)
+{
+        const char *p = str;
+        char *end;
+        unsigned long rev;
+        unsigned long long ia;
+        uint32_t sub[MAXSUBAUTH];
+        int count = 0;
+        int i;
+
+        if (p == NULL || (p[0] != 'S' && p[0] != 's') || p[1] != '-') {
+                printf("Failed to parse SID value for %s: %s\n",
+                       name, str ? str : "(null)");
+                return -1;
+        }
+        p += 2;
+
+        rev = strtoul(p, &end, 10);
+        if (end == p || *end != '-' || rev > 255) {
+                printf("Failed to parse SID revision for %s: %s\n",
+                       name, str);
+                return -1;
+        }
+        p = end + 1;
+
+        if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+                ia = strtoull(p, &end, 16);
+        } else {
+                ia = strtoull(p, &end, 10);
+        }
+        if (end == p) {
+                printf("Failed to parse SID authority for %s: %s\n",
+                       name, str);
+                return -1;
+        }
+        p = end;
+
+        while (*p == '-') {
+                unsigned long sa;
+
+                p++;
+                if (count >= MAXSUBAUTH) {
+                        printf("Too many SID subauthorities for %s: %s\n",
+                               name, str);
+                        return -1;
+                }
+                sa = strtoul(p, &end, 10);
+                if (end == p) {
+                        printf("Failed to parse SID subauthority for %s: %s\n",
+                               name, str);
+                        return -1;
+                }
+                sub[count++] = (uint32_t)sa;
+                p = end;
+        }
+        if (*p != '\0') {
+                printf("Failed to parse SID value for %s: %s\n",
+                       name, str);
+                return -1;
+        }
+
+        sid->Revision = (uint8_t)rev;
+        sid->SubAuthorityCount = (uint8_t)count;
+        for (i = 0; i < 6; i++) {
+                sid->IdentifierAuthority[i] =
+                        (uint8_t)((ia >> (8 * (5 - i))) & 0xff);
+        }
+        for (i = 0; i < count; i++) {
+                sid->SubAuthority[i] = sub[i];
+        }
+        return 0;
+}
+
+static int
+sid_to_string(char *name, const RPC_SID *sid, char *sidstr, size_t size)
+{
+        uint64_t ia = 0;
+        int len;
+        int i;
+
+        for (i = 0; i < 6; i++) {
+                ia = (ia << 8) | sid->IdentifierAuthority[i];
+        }
+
+        if (ia <= 0xffffffffULL) {
+                len = snprintf(sidstr, size, "S-%u-%llu",
+                               sid->Revision, (unsigned long long)ia);
+        } else {
+                len = snprintf(sidstr, size, "S-%u-0x%llx",
+                               sid->Revision, (unsigned long long)ia);
+        }
+        if (len < 0 || (size_t)len >= size) {
+                printf("Failed to format SID for %s\n", name);
+                return -1;
+        }
+        for (i = 0; i < sid->SubAuthorityCount; i++) {
+                int n;
+
+                n = snprintf(sidstr + len, size - (size_t)len,
+                             "-%u", sid->SubAuthority[i]);
+                if (n < 0 || (size_t)len + (size_t)n >= size) {
+                        printf("Failed to format SID for %s\n", name);
+                        return -1;
+                }
+                len += n;
+        }
+        return 0;
+}
+
+/*
+ * Text (YAML/JSON) RPC_SID: the S-R-I-... string, carried as a plain
+ * string value by the encoding's string coder. Used as the sid_coder
+ * of every non-NDR encoding.
+ */
+int
+text_sid_coder(char *name, struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
+               struct dcerpc_iovec *iov, void *ptr)
+{
+        RPC_SID *sid = ptr;
+        char sidstr[256];
+        char *str = sidstr;
+
+        if (dcerpc_pdu_direction(pdu) == DCERPC_DECODE) {
+                if (dcerpc_utf16_coder(name, dce, pdu, iov, &str)) {
+                        return -1;
+                }
+                return sid_from_string(name, str, sid);
+        }
+        if (sid_to_string(name, sid, sidstr, sizeof(sidstr))) {
+                return -1;
+        }
+        return dcerpc_utf16_coder(name, dce, pdu, iov, &str);
+}
+
+/*
  * SID field for ACE packet types: NDR = packet form; YAML/JSON = S-R-I-...
  */
 static int
 dcerpc_packet_sid_coder(char *name, struct dcerpc_context *dce,
                         struct dcerpc_pdu *pdu,
-                        struct dcerpc_iovec *iov, int *offset,
+                        struct dcerpc_iovec *iov,
                         void *ptr)
 {
         switch (dcerpc_pdu_encoding(pdu)) {
         case ENCODING_NDR:
-                return ndr_packet_sid_coder(name, dce, pdu, iov, offset, ptr);
-        case ENCODING_YAML:
-                return yaml_sid_coder(name, dce, pdu, iov, offset, ptr);
-        case ENCODING_JSON:
-                return json_sid_coder(name, dce, pdu, iov, offset, ptr);
+                return ndr_packet_sid_coder(name, dce, pdu, iov, ptr);
+        default:
+                return dcerpc_sid_coder(name, dce, pdu, iov, ptr);
         }
-        return 0;
+}
+
+/*
+ * Self-relative SECURITY_DESCRIPTORs, ACLs and ACEs are MS-DTYP packet
+ * formats: fixed little-endian byte layouts carried as opaque data, not NDR.
+ * Code them with the PDU forced to little-endian so a big-endian NDR data
+ * representation does not byte-swap their fields.
+ */
+static int
+packet_form_struct_coder(char *name, struct dcerpc_context *dce,
+                         struct dcerpc_pdu *pdu,
+                         struct dcerpc_iovec *iov,
+                         void *ptr, dcerpc_coder coder)
+{
+        int rc;
+
+        dcerpc_pdu_packet_form_begin(pdu);
+        rc = dcerpc_struct_coder(name, dce, pdu, iov, ptr, coder);
+        dcerpc_pdu_packet_form_end(pdu);
+        return rc;
 }
 
 /*
@@ -688,7 +531,7 @@ ace_mask_sid_size(const struct ace_mask_sid *ace)
 static int
 ace_mask_sid_fields_coder(char *name, struct dcerpc_context *dce,
                           struct dcerpc_pdu *pdu,
-                          struct dcerpc_iovec *iov, int *offset,
+                          struct dcerpc_iovec *iov,
                           void *ptr)
 {
         struct ace_mask_sid *ace = ptr;
@@ -702,15 +545,15 @@ ace_mask_sid_fields_coder(char *name, struct dcerpc_context *dce,
                 ace->Header.AceSize = ace_mask_sid_size(ace);
         }
 
-        if (dcerpc_ACE_HEADER_coder("Header", dce, pdu, iov, offset,
+        if (dcerpc_ACE_HEADER_coder("Header", dce, pdu, iov,
                                     &ace->Header)) {
                 return -1;
         }
-        if (dcerpc_uint32_coder_pp("Mask", dce, pdu, iov, offset,
+        if (dcerpc_uint32_coder_pp("Mask", dce, pdu, iov,
                                    &ace->Mask, &access_mask_pp)) {
                 return -1;
         }
-        if (dcerpc_packet_sid_coder("Sid", dce, pdu, iov, offset,
+        if (dcerpc_packet_sid_coder("Sid", dce, pdu, iov,
                                     &ace->Sid)) {
                 return -1;
         }
@@ -734,61 +577,61 @@ ace_mask_sid_fields_coder(char *name, struct dcerpc_context *dce,
 int
 dcerpc_ACCESS_ALLOWED_ACE_coder(char *name, struct dcerpc_context *dce,
                                 struct dcerpc_pdu *pdu,
-                                struct dcerpc_iovec *iov, int *offset,
+                                struct dcerpc_iovec *iov,
                                 void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   ace_mask_sid_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        ace_mask_sid_fields_coder);
 }
 
 int
 dcerpc_ACCESS_DENIED_ACE_coder(char *name, struct dcerpc_context *dce,
                                struct dcerpc_pdu *pdu,
-                               struct dcerpc_iovec *iov, int *offset,
+                               struct dcerpc_iovec *iov,
                                void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   ace_mask_sid_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        ace_mask_sid_fields_coder);
 }
 
 int
 dcerpc_SYSTEM_AUDIT_ACE_coder(char *name, struct dcerpc_context *dce,
                               struct dcerpc_pdu *pdu,
-                              struct dcerpc_iovec *iov, int *offset,
+                              struct dcerpc_iovec *iov,
                               void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   ace_mask_sid_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        ace_mask_sid_fields_coder);
 }
 
 int
 dcerpc_SYSTEM_ALARM_ACE_coder(char *name, struct dcerpc_context *dce,
                               struct dcerpc_pdu *pdu,
-                              struct dcerpc_iovec *iov, int *offset,
+                              struct dcerpc_iovec *iov,
                               void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   ace_mask_sid_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        ace_mask_sid_fields_coder);
 }
 
 int
 dcerpc_SYSTEM_MANDATORY_LABEL_ACE_coder(char *name, struct dcerpc_context *dce,
                                         struct dcerpc_pdu *pdu,
-                                        struct dcerpc_iovec *iov, int *offset,
+                                        struct dcerpc_iovec *iov,
                                         void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   ace_mask_sid_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        ace_mask_sid_fields_coder);
 }
 
 int
 dcerpc_SYSTEM_SCOPED_POLICY_ID_ACE_coder(char *name, struct dcerpc_context *dce,
                                          struct dcerpc_pdu *pdu,
-                                         struct dcerpc_iovec *iov, int *offset,
+                                         struct dcerpc_iovec *iov,
                                          void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   ace_mask_sid_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        ace_mask_sid_fields_coder);
 }
 
 /*
@@ -838,7 +681,7 @@ acl_compute_size(const ACL *acl)
 static int
 acl_aces_coder(char *name, struct dcerpc_context *dce,
                struct dcerpc_pdu *pdu,
-               struct dcerpc_iovec *iov, int *offset,
+               struct dcerpc_iovec *iov,
                void *ptr)
 {
         ACL *acl = ptr;
@@ -851,7 +694,7 @@ acl_aces_coder(char *name, struct dcerpc_context *dce,
                 if (acl->Aces == NULL) {
                         return -1;
                 }
-                return dcerpc_carray_coder("Aces", dce, pdu, iov, offset,
+                return dcerpc_carray_coder("Aces", dce, pdu, iov,
                                            acl->AceCount, acl->Aces,
                                            (int)sizeof(ACCESS_ALLOWED_ACE),
                                            ace_mask_sid_fields_coder);
@@ -859,7 +702,7 @@ acl_aces_coder(char *name, struct dcerpc_context *dce,
 
         /* NDR packet form: ACEs back-to-back, no size_is prefix. */
         for (i = 0; i < acl->AceCount; i++) {
-                if (ace_mask_sid_fields_coder("Ace", dce, pdu, iov, offset,
+                if (ace_mask_sid_fields_coder("Ace", dce, pdu, iov,
                                               &acl->Aces[i])) {
                         return -1;
                 }
@@ -870,7 +713,7 @@ acl_aces_coder(char *name, struct dcerpc_context *dce,
 static int
 acl_fields_coder(char *name, struct dcerpc_context *dce,
                  struct dcerpc_pdu *pdu,
-                 struct dcerpc_iovec *iov, int *offset,
+                 struct dcerpc_iovec *iov,
                  void *ptr)
 {
         ACL *acl = ptr;
@@ -883,7 +726,7 @@ acl_fields_coder(char *name, struct dcerpc_context *dce,
                 acl->AclSize = acl_compute_size(acl);
         }
 
-        if (dcerpc_uint8_pp_coder("AclRevision", dce, pdu, iov, offset,
+        if (dcerpc_uint8_pp_coder("AclRevision", dce, pdu, iov,
                                   &acl->AclRevision, &acl_revision_pp)) {
                 return -1;
         }
@@ -892,24 +735,24 @@ acl_fields_coder(char *name, struct dcerpc_context *dce,
         if (dcerpc_pdu_encoding(pdu) == ENCODING_NDR) {
                 if (dcerpc_pdu_direction(pdu) == DCERPC_ENCODE) {
                         zero = 0;
-                        if (ndr_uint8_coder("Sbz1", dce, pdu, iov, offset,
+                        if (ndr_uint8_coder("Sbz1", dce, pdu, iov,
                                             &zero)) {
                                 return -1;
                         }
                 } else {
-                        if (ndr_uint8_coder("Sbz1", dce, pdu, iov, offset,
+                        if (ndr_uint8_coder("Sbz1", dce, pdu, iov,
                                             &acl->Sbz1)) {
                                 return -1;
                         }
                 }
-                if (dcerpc_uint16_coder("AclSize", dce, pdu, iov, offset,
+                if (dcerpc_uint16_coder("AclSize", dce, pdu, iov,
                                         &acl->AclSize)) {
                         return -1;
                 }
         }
 
         ace_count = acl->AceCount;
-        if (dcerpc_uint16_coder("AceCount", dce, pdu, iov, offset,
+        if (dcerpc_uint16_coder("AceCount", dce, pdu, iov,
                                 &ace_count)) {
                 return -1;
         }
@@ -925,13 +768,12 @@ acl_fields_coder(char *name, struct dcerpc_context *dce,
                         {
                                 uint16_t z16 = 0;
 
-                                if (dcerpc_uint16_coder("Sbz2", dce, pdu, iov,
-                                                        offset, &z16)) {
+                                if (dcerpc_uint16_coder("Sbz2", dce, pdu, iov, &z16)) {
                                         return -1;
                                 }
                         }
                 } else {
-                        if (dcerpc_uint16_coder("Sbz2", dce, pdu, iov, offset,
+                        if (dcerpc_uint16_coder("Sbz2", dce, pdu, iov,
                                                 &acl->Sbz2)) {
                                 return -1;
                         }
@@ -947,7 +789,7 @@ acl_fields_coder(char *name, struct dcerpc_context *dce,
                 }
         }
 
-        if (acl_aces_coder("Aces", dce, pdu, iov, offset, acl)) {
+        if (acl_aces_coder("Aces", dce, pdu, iov, acl)) {
                 return -1;
         }
 
@@ -963,11 +805,11 @@ acl_fields_coder(char *name, struct dcerpc_context *dce,
 int
 dcerpc_ACL_coder(char *name, struct dcerpc_context *dce,
                  struct dcerpc_pdu *pdu,
-                 struct dcerpc_iovec *iov, int *offset,
+                 struct dcerpc_iovec *iov,
                  void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   acl_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        acl_fields_coder);
 }
 
 /*
@@ -1009,22 +851,32 @@ static struct dcerpc_uint32_pretty_printer sd_control_pp = {
         },
 };
 
+/* Code a uint32 at pos, leaving the buffer position as it was */
+static int
+sd_u32_at(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
+          struct dcerpc_iovec *iov, size_t pos, uint32_t *val)
+{
+        size_t saved = iov->offset;
+        int ret;
+
+        iov->offset = pos;
+        ret = ndr_uint32_coder("", dce, pdu, iov, val);
+        iov->offset = saved;
+        return ret;
+}
+
 static int
 sd_write_u32_at(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-                struct dcerpc_iovec *iov, int pos, uint32_t val)
+                struct dcerpc_iovec *iov, size_t pos, uint32_t val)
 {
-        int o = pos;
-
-        return ndr_uint32_coder("", dce, pdu, iov, &o, &val);
+        return sd_u32_at(dce, pdu, iov, pos, &val);
 }
 
 static int
 sd_read_u32_at(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-               struct dcerpc_iovec *iov, int pos, uint32_t *val)
+               struct dcerpc_iovec *iov, size_t pos, uint32_t *val)
 {
-        int o = pos;
-
-        return ndr_uint32_coder("", dce, pdu, iov, &o, val);
+        return sd_u32_at(dce, pdu, iov, pos, val);
 }
 
 /*
@@ -1034,14 +886,14 @@ sd_read_u32_at(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
 static int
 sd_optional_sid_text(char *name, struct dcerpc_context *dce,
                      struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset,
+                     struct dcerpc_iovec *iov,
                      RPC_SID **sidp)
 {
         if (dcerpc_pdu_direction(pdu) == DCERPC_ENCODE) {
                 if (*sidp == NULL) {
                         return 0;
                 }
-                return dcerpc_packet_sid_coder(name, dce, pdu, iov, offset,
+                return dcerpc_packet_sid_coder(name, dce, pdu, iov,
                                                *sidp);
         }
 
@@ -1055,7 +907,7 @@ sd_optional_sid_text(char *name, struct dcerpc_context *dce,
                 int rc;
                 char *jk;
 
-                rc = dcerpc_json_next_key(pdu, iov, offset);
+                rc = dcerpc_json_next_key(pdu, iov);
                 if (rc != 0) {
                         return rc < 0 ? -1 : 0;
                 }
@@ -1070,7 +922,7 @@ sd_optional_sid_text(char *name, struct dcerpc_context *dce,
         if (*sidp == NULL) {
                 return -1;
         }
-        return dcerpc_packet_sid_coder(name, dce, pdu, iov, offset, *sidp);
+        return dcerpc_packet_sid_coder(name, dce, pdu, iov, *sidp);
 }
 
 /*
@@ -1079,14 +931,14 @@ sd_optional_sid_text(char *name, struct dcerpc_context *dce,
 static int
 sd_optional_acl_text(char *name, struct dcerpc_context *dce,
                      struct dcerpc_pdu *pdu,
-                     struct dcerpc_iovec *iov, int *offset,
+                     struct dcerpc_iovec *iov,
                      ACL **aclp)
 {
         if (dcerpc_pdu_direction(pdu) == DCERPC_ENCODE) {
                 if (*aclp == NULL) {
                         return 0;
                 }
-                return dcerpc_ACL_coder(name, dce, pdu, iov, offset, *aclp);
+                return dcerpc_ACL_coder(name, dce, pdu, iov, *aclp);
         }
 
         if (dcerpc_pdu_encoding(pdu) == ENCODING_YAML) {
@@ -1098,7 +950,7 @@ sd_optional_acl_text(char *name, struct dcerpc_context *dce,
                 int rc;
                 char *jk;
 
-                rc = dcerpc_json_next_key(pdu, iov, offset);
+                rc = dcerpc_json_next_key(pdu, iov);
                 if (rc != 0) {
                         return rc < 0 ? -1 : 0;
                 }
@@ -1113,20 +965,20 @@ sd_optional_acl_text(char *name, struct dcerpc_context *dce,
         if (*aclp == NULL) {
                 return -1;
         }
-        return dcerpc_ACL_coder(name, dce, pdu, iov, offset, *aclp);
+        return dcerpc_ACL_coder(name, dce, pdu, iov, *aclp);
 }
 
 static int
 sd_ndr_encode(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-              struct dcerpc_iovec *iov, int *offset, SECURITY_DESCRIPTOR *sd)
+              struct dcerpc_iovec *iov, SECURITY_DESCRIPTOR *sd)
 {
-        int base;
-        int pos;
+        size_t base;
+        size_t pos;
         uint32_t off_owner = 0, off_group = 0, off_sacl = 0, off_dacl = 0;
         uint16_t control;
         uint8_t rev, sbz1;
 
-        base = *offset;
+        base = iov->offset;
         control = sd->Control | SE_SELF_RELATIVE;
         if (sd->Dacl) {
                 control = (uint16_t)(control | SE_DACL_PRESENT);
@@ -1138,14 +990,14 @@ sd_ndr_encode(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
         sd->Sbz1 = 0;
 
         rev = sd->Revision ? sd->Revision : 1;
-        if (ndr_uint8_coder("Revision", dce, pdu, iov, offset, &rev)) {
+        if (ndr_uint8_coder("Revision", dce, pdu, iov, &rev)) {
                 return -1;
         }
         sbz1 = 0;
-        if (ndr_uint8_coder("Sbz1", dce, pdu, iov, offset, &sbz1)) {
+        if (ndr_uint8_coder("Sbz1", dce, pdu, iov, &sbz1)) {
                 return -1;
         }
-        if (dcerpc_uint16_coder("Control", dce, pdu, iov, offset, &control)) {
+        if (dcerpc_uint16_coder("Control", dce, pdu, iov, &control)) {
                 return -1;
         }
 
@@ -1156,42 +1008,47 @@ sd_ndr_encode(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
             sd_write_u32_at(dce, pdu, iov, base + 16, 0)) {
                 return -1;
         }
-        *offset = base + 20;
-        pos = *offset;
+        iov->offset = base + 20;
+        pos = iov->offset;
 
-        if (sd->Owner) {
-                off_owner = (uint32_t)(pos - base);
-                *offset = pos;
-                if (ndr_packet_sid_coder("Owner", dce, pdu, iov, offset,
-                                         sd->Owner)) {
-                        return -1;
-                }
-                pos = *offset;
-        }
-        if (sd->Group) {
-                off_group = (uint32_t)(pos - base);
-                *offset = pos;
-                if (ndr_packet_sid_coder("Group", dce, pdu, iov, offset,
-                                         sd->Group)) {
-                        return -1;
-                }
-                pos = *offset;
-        }
+        /*
+         * Same order as Windows writes self-relative descriptors (SACL,
+         * DACL, Owner, Group), so a descriptor from Windows re-encodes
+         * byte for byte.
+         */
         if (sd->Sacl) {
                 off_sacl = (uint32_t)(pos - base);
-                *offset = pos;
-                if (acl_fields_coder("Sacl", dce, pdu, iov, offset, sd->Sacl)) {
+                iov->offset = pos;
+                if (acl_fields_coder("Sacl", dce, pdu, iov, sd->Sacl)) {
                         return -1;
                 }
-                pos = *offset;
+                pos = iov->offset;
         }
         if (sd->Dacl) {
                 off_dacl = (uint32_t)(pos - base);
-                *offset = pos;
-                if (acl_fields_coder("Dacl", dce, pdu, iov, offset, sd->Dacl)) {
+                iov->offset = pos;
+                if (acl_fields_coder("Dacl", dce, pdu, iov, sd->Dacl)) {
                         return -1;
                 }
-                pos = *offset;
+                pos = iov->offset;
+        }
+        if (sd->Owner) {
+                off_owner = (uint32_t)(pos - base);
+                iov->offset = pos;
+                if (ndr_packet_sid_coder("Owner", dce, pdu, iov,
+                                         sd->Owner)) {
+                        return -1;
+                }
+                pos = iov->offset;
+        }
+        if (sd->Group) {
+                off_group = (uint32_t)(pos - base);
+                iov->offset = pos;
+                if (ndr_packet_sid_coder("Group", dce, pdu, iov,
+                                         sd->Group)) {
+                        return -1;
+                }
+                pos = iov->offset;
         }
 
         if (sd_write_u32_at(dce, pdu, iov, base + 4, off_owner) ||
@@ -1200,27 +1057,26 @@ sd_ndr_encode(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
             sd_write_u32_at(dce, pdu, iov, base + 16, off_dacl)) {
                 return -1;
         }
-        *offset = pos;
+        iov->offset = pos;
         return 0;
 }
 
 static int
 sd_ndr_decode(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
-              struct dcerpc_iovec *iov, int *offset, SECURITY_DESCRIPTOR *sd)
+              struct dcerpc_iovec *iov, SECURITY_DESCRIPTOR *sd)
 {
-        int base;
-        int end;
-        int o;
+        size_t base;
+        size_t end;
         uint32_t off_owner, off_group, off_sacl, off_dacl;
 
-        base = *offset;
-        if (ndr_uint8_coder("Revision", dce, pdu, iov, offset, &sd->Revision)) {
+        base = iov->offset;
+        if (ndr_uint8_coder("Revision", dce, pdu, iov, &sd->Revision)) {
                 return -1;
         }
-        if (ndr_uint8_coder("Sbz1", dce, pdu, iov, offset, &sd->Sbz1)) {
+        if (ndr_uint8_coder("Sbz1", dce, pdu, iov, &sd->Sbz1)) {
                 return -1;
         }
-        if (dcerpc_uint16_coder("Control", dce, pdu, iov, offset, &sd->Control)) {
+        if (dcerpc_uint16_coder("Control", dce, pdu, iov, &sd->Control)) {
                 return -1;
         }
         if (sd_read_u32_at(dce, pdu, iov, base + 4, &off_owner) ||
@@ -1229,69 +1085,69 @@ sd_ndr_decode(struct dcerpc_context *dce, struct dcerpc_pdu *pdu,
             sd_read_u32_at(dce, pdu, iov, base + 16, &off_dacl)) {
                 return -1;
         }
-        *offset = base + 20;
+        iov->offset = base + 20;
         end = base + 20;
 
         if (off_owner) {
-                o = base + (int)off_owner;
+                iov->offset = base + off_owner;
                 sd->Owner = dcerpc_alloc_data(pdu,
                                             sizeof(RPC_SID));
                 if (sd->Owner == NULL) {
                         return -1;
                 }
-                if (ndr_packet_sid_coder("Owner", dce, pdu, iov, &o,
+                if (ndr_packet_sid_coder("Owner", dce, pdu, iov,
                                          sd->Owner)) {
                         return -1;
                 }
-                if (o > end) {
-                        end = o;
+                if (iov->offset > end) {
+                        end = iov->offset;
                 }
         }
         if (off_group) {
-                o = base + (int)off_group;
+                iov->offset = base + off_group;
                 sd->Group = dcerpc_alloc_data(pdu,
                                             sizeof(RPC_SID));
                 if (sd->Group == NULL) {
                         return -1;
                 }
-                if (ndr_packet_sid_coder("Group", dce, pdu, iov, &o,
+                if (ndr_packet_sid_coder("Group", dce, pdu, iov,
                                          sd->Group)) {
                         return -1;
                 }
-                if (o > end) {
-                        end = o;
+                if (iov->offset > end) {
+                        end = iov->offset;
                 }
         }
         if (off_sacl) {
-                o = base + (int)off_sacl;
+                iov->offset = base + off_sacl;
                 sd->Sacl = dcerpc_alloc_data(pdu,
                                            sizeof(ACL));
                 if (sd->Sacl == NULL) {
                         return -1;
                 }
-                if (acl_fields_coder("Sacl", dce, pdu, iov, &o, sd->Sacl)) {
+                if (acl_fields_coder("Sacl", dce, pdu, iov, sd->Sacl)) {
                         return -1;
                 }
-                if (o > end) {
-                        end = o;
+                if (iov->offset > end) {
+                        end = iov->offset;
                 }
         }
         if (off_dacl) {
-                o = base + (int)off_dacl;
+                iov->offset = base + off_dacl;
                 sd->Dacl = dcerpc_alloc_data(pdu,
                                            sizeof(ACL));
                 if (sd->Dacl == NULL) {
                         return -1;
                 }
-                if (acl_fields_coder("Dacl", dce, pdu, iov, &o, sd->Dacl)) {
+                if (acl_fields_coder("Dacl", dce, pdu, iov, sd->Dacl)) {
                         return -1;
                 }
-                if (o > end) {
-                        end = o;
+                if (iov->offset > end) {
+                        end = iov->offset;
                 }
         }
 
-        *offset = end;
+        iov->offset = end;
         return 0;
 }
 
@@ -1306,7 +1162,7 @@ static struct dcerpc_uint32_pretty_printer sd_revision_pp = {
 static int
 security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
                                  struct dcerpc_pdu *pdu,
-                                 struct dcerpc_iovec *iov, int *offset,
+                                 struct dcerpc_iovec *iov,
                                  void *ptr)
 {
         SECURITY_DESCRIPTOR *sd = ptr;
@@ -1319,9 +1175,9 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
                         return 0;
                 }
                 if (dcerpc_pdu_direction(pdu) == DCERPC_ENCODE) {
-                        return sd_ndr_encode(dce, pdu, iov, offset, sd);
+                        return sd_ndr_encode(dce, pdu, iov, sd);
                 }
-                return sd_ndr_decode(dce, pdu, iov, offset, sd);
+                return sd_ndr_decode(dce, pdu, iov, sd);
         }
 
         /* YAML / JSON — logical absolute form (no offsets / Sbz1) */
@@ -1329,7 +1185,7 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
             sd->Revision == 0) {
                 sd->Revision = 1;
         }
-        if (dcerpc_uint8_pp_coder("Revision", dce, pdu, iov, offset,
+        if (dcerpc_uint8_pp_coder("Revision", dce, pdu, iov,
                                   &sd->Revision, &sd_revision_pp)) {
                 return -1;
         }
@@ -1345,7 +1201,7 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
                 sd->Control = control;
                 control32 = control;
         }
-        if (dcerpc_uint32_coder_pp("Control", dce, pdu, iov, offset,
+        if (dcerpc_uint32_coder_pp("Control", dce, pdu, iov,
                                    &control32, &sd_control_pp)) {
                 return -1;
         }
@@ -1354,13 +1210,13 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
         }
 
         if (dcerpc_pdu_direction(pdu) == DCERPC_ENCODE) {
-                if (sd_optional_sid_text("Owner", dce, pdu, iov, offset,
+                if (sd_optional_sid_text("Owner", dce, pdu, iov,
                                          &sd->Owner) ||
-                    sd_optional_sid_text("Group", dce, pdu, iov, offset,
+                    sd_optional_sid_text("Group", dce, pdu, iov,
                                          &sd->Group) ||
-                    sd_optional_acl_text("Sacl", dce, pdu, iov, offset,
+                    sd_optional_acl_text("Sacl", dce, pdu, iov,
                                          &sd->Sacl) ||
-                    sd_optional_acl_text("Dacl", dce, pdu, iov, offset,
+                    sd_optional_acl_text("Dacl", dce, pdu, iov,
                                          &sd->Dacl)) {
                         return -1;
                 }
@@ -1379,7 +1235,7 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
                         } else {
                                 int rc;
 
-                                rc = dcerpc_json_next_key(pdu, iov, offset);
+                                rc = dcerpc_json_next_key(pdu, iov);
                                 if (rc != 0) {
                                         break;
                                 }
@@ -1389,23 +1245,19 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
                                 break;
                         }
                         if (!strcmp(key, "Owner")) {
-                                if (sd_optional_sid_text("Owner", dce, pdu, iov,
-                                                         offset, &sd->Owner)) {
+                                if (sd_optional_sid_text("Owner", dce, pdu, iov, &sd->Owner)) {
                                         return -1;
                                 }
                         } else if (!strcmp(key, "Group")) {
-                                if (sd_optional_sid_text("Group", dce, pdu, iov,
-                                                         offset, &sd->Group)) {
+                                if (sd_optional_sid_text("Group", dce, pdu, iov, &sd->Group)) {
                                         return -1;
                                 }
                         } else if (!strcmp(key, "Sacl")) {
-                                if (sd_optional_acl_text("Sacl", dce, pdu, iov,
-                                                         offset, &sd->Sacl)) {
+                                if (sd_optional_acl_text("Sacl", dce, pdu, iov, &sd->Sacl)) {
                                         return -1;
                                 }
                         } else if (!strcmp(key, "Dacl")) {
-                                if (sd_optional_acl_text("Dacl", dce, pdu, iov,
-                                                         offset, &sd->Dacl)) {
+                                if (sd_optional_acl_text("Dacl", dce, pdu, iov, &sd->Dacl)) {
                                         return -1;
                                 }
                         } else {
@@ -1420,9 +1272,9 @@ security_descriptor_fields_coder(char *name, struct dcerpc_context *dce,
 int
 dcerpc_SECURITY_DESCRIPTOR_coder(char *name, struct dcerpc_context *dce,
                                  struct dcerpc_pdu *pdu,
-                                 struct dcerpc_iovec *iov, int *offset,
+                                 struct dcerpc_iovec *iov,
                                  void *ptr)
 {
-        return dcerpc_struct_coder(name, dce, pdu, iov, offset, ptr,
-                                   security_descriptor_fields_coder);
+        return packet_form_struct_coder(name, dce, pdu, iov, ptr,
+                                        security_descriptor_fields_coder);
 }

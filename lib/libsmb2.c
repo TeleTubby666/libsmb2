@@ -128,12 +128,10 @@ static const char SmbSign[] = "SmbSign";
 static const char SMB2AESCCM[] = "SMB2AESCCM";
 static const char ServerOut[] = "ServerOut";
 static const char ServerIn[] = "ServerIn ";
-/* The following strings will be used for deriving other keys */
-#if 0
+/* and the application key */
 static const char SMB2APP[] = "SMB2APP";
 static const char SmbRpc[] = "SmbRpc";
 static const char SMBAppKey[] = "SMBAppKey";
-#endif
 
 const smb2_file_id compound_file_id = {
         0xff, 0xff, 0xff, 0xff,  0xff, 0xff, 0xff, 0xff,
@@ -175,6 +173,14 @@ struct smb2fh {
         char *path;
         int flags;
         int symlink_hops;
+
+        /*
+         * For smb2_open_async_pdu(): the pdu the caller owns, until the
+         * first callback runs. Freeing the pdu before that cancels the
+         * open, which then frees fh and calls cancel_free_cb(cb_data).
+         */
+        struct smb2_pdu *cancel_pdu;
+        void (*cancel_free_cb)(void *);
 };
 
 void
@@ -191,13 +197,17 @@ smb2_close_context(struct smb2_context *smb2)
                 close(smb2->fd);
                 smb2->fd = SMB2_INVALID_SOCKET;
         }
+        smb2_quic_reset(smb2);
+        smb2_rdma_reset(smb2);
 
         smb2->message_id = 0;
         smb2->session_id = 0;
+        smb2->enc_keys_ready = 0;
         smb2->tree_id_top = 0;
         smb2->tree_id_cur = 0;
         smb2->tree_id[0] = 0xdeadbeef;
         memset(smb2->signing_key, 0, SMB2_KEY_SIZE);
+        memset(smb2->application_key, 0, SMB2_KEY_SIZE);
         if (smb2->session_key) {
                 free(smb2->session_key);
                 smb2->session_key = NULL;
@@ -422,6 +432,8 @@ od_close_cb(struct smb2_context *smb2, int status,
         struct smb2dir *dir = private_data;
 
         if (status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, status, "Close failed with (0x%08x) %s",
+                                 status, nterror_to_str(status));
                 dir->cb(smb2, -nterror_to_errno(status),
                         NULL, dir->cb_data);
                 free_smb2dir(smb2, dir);
@@ -502,6 +514,18 @@ query_cb(struct smb2_context *smb2, int status,
         free_smb2dir(smb2, dir);
 }
 
+/* The caller freed the opendir pdu before its callback ran */
+static void
+opendir_cancelled(void *private_data)
+{
+        struct smb2dir *dir = private_data;
+
+        if (dir->cancel_free_cb) {
+                dir->cancel_free_cb(dir->cb_data);
+        }
+        free_smb2dir(NULL, dir);
+}
+
 static void
 opendir_cb(struct smb2_context *smb2, int status,
            void *command_data, void *private_data)
@@ -510,6 +534,12 @@ opendir_cb(struct smb2_context *smb2, int status,
         struct smb2_create_reply *rep = command_data;
         struct smb2_query_directory_request req;
         struct smb2_pdu *pdu;
+
+        /* Completed: freeing the caller's pdu no longer cancels */
+        if (dir->cancel_pdu) {
+                dir->cancel_pdu->free_cb = NULL;
+                dir->cancel_pdu = NULL;
+        }
 
         if (status != SMB2_STATUS_SUCCESS) {
                 smb2_set_nterror(smb2, status, "Opendir failed with (0x%08x) %s.",
@@ -579,7 +609,11 @@ _smb2_opendir_async(struct smb2_context *smb2, const char *path,
                 smb2_set_error(smb2, "Failed to create opendir command.");
                 return NULL;
         }
-        pdu->free_cb = free_cb;
+        if (caller_frees_pdu) {
+                dir->cancel_pdu = pdu;
+                dir->cancel_free_cb = free_cb;
+                pdu->free_cb = opendir_cancelled;
+        }
         pdu->caller_frees_pdu = caller_frees_pdu;
         smb2_queue_pdu(smb2, pdu);
 
@@ -716,6 +750,10 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                 memcpy(smb2->signing_key,
                        smb2->session_key,
                        MIN(smb2->session_key_size, SMB2_KEY_SIZE));
+                /* and the application key */
+                memcpy(smb2->application_key,
+                       smb2->session_key,
+                       MIN(smb2->session_key_size, SMB2_KEY_SIZE));
         } else if (smb2->dialect <= SMB2_VERSION_0302) {
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
@@ -724,6 +762,13 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 SmbSign,
                                 sizeof(SmbSign),
                                 smb2->signing_key);
+                smb2_derive_key(smb2->session_key,
+                                smb2->session_key_size,
+                                SMB2APP,
+                                sizeof(SMB2APP),
+                                SmbRpc,
+                                sizeof(SmbRpc),
+                                smb2->application_key);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMB2AESCCM,
@@ -746,6 +791,13 @@ static void smb2_create_signing_key(struct smb2_context *smb2)
                                 (char *)smb2->preauthhash,
                                 SMB2_PREAUTH_HASH_SIZE,
                                 smb2->signing_key);
+                smb2_derive_key(smb2->session_key,
+                                smb2->session_key_size,
+                                SMBAppKey,
+                                sizeof(SMBAppKey),
+                                (char *)smb2->preauthhash,
+                                SMB2_PREAUTH_HASH_SIZE,
+                                smb2->application_key);
                 smb2_derive_key(smb2->session_key,
                                 smb2->session_key_size,
                                 SMBC2SCipherKey,
@@ -852,6 +904,9 @@ session_setup_cb(struct smb2_context *smb2, int status,
                 }
 
                 smb2_create_signing_key(smb2);
+                if (smb2->dialect >= SMB2_VERSION_0300) {
+                        smb2->enc_keys_ready = 1;
+                }
 
                 /*
                  * This is the final leg of session setup, the first message
@@ -997,6 +1052,11 @@ negotiate_cb(struct smb2_context *smb2, int status,
         smb2->max_transact_size = rep->max_transact_size;
         smb2->max_read_size     = rep->max_read_size;
         smb2->max_write_size    = rep->max_write_size;
+#ifdef HAVE_LIBRDMACM
+        if (smb2->rdma) {
+                smb2_rdma_cap_io_sizes(smb2);
+        }
+#endif
         smb2->dialect           = rep->dialect_revision;
         smb2->cypher            = rep->cypher;
 
@@ -1152,6 +1212,16 @@ connect_cb(struct smb2_context *smb2, int status,
         req.security_mode = smb2->security_mode;
         switch (smb2->version) {
         case SMB2_VERSION_ANY:
+#ifdef HAVE_LIBRDMACM
+                /* SMB2 over RDMA needs dialect 3.0 or later */
+                if (smb2->rdma) {
+                        req.dialect_count = 3;
+                        req.dialects[0] = SMB2_VERSION_0300;
+                        req.dialects[1] = SMB2_VERSION_0302;
+                        req.dialects[2] = SMB2_VERSION_0311;
+                        break;
+                }
+#endif
                 req.dialect_count = 5;
                 req.dialects[0] = SMB2_VERSION_0202;
                 req.dialects[1] = SMB2_VERSION_0210;
@@ -1520,12 +1590,30 @@ open_retry(struct smb2_context *smb2, struct smb2fh *fh)
         return 0;
 }
 
+/* The caller freed the open pdu before its callback ran */
+static void
+open_cancelled(void *private_data)
+{
+        struct smb2fh *fh = private_data;
+
+        if (fh->cancel_free_cb) {
+                fh->cancel_free_cb(fh->cb_data);
+        }
+        free_smb2fh(NULL, fh);
+}
+
 static void
 open_cb(struct smb2_context *smb2, int status,
         void *command_data, void *private_data)
 {
         struct smb2fh *fh = private_data;
         struct smb2_create_reply *rep = command_data;
+
+        /* Completed: freeing the caller's pdu no longer cancels */
+        if (fh->cancel_pdu) {
+                fh->cancel_pdu->free_cb = NULL;
+                fh->cancel_pdu = NULL;
+        }
 
         if (status == SMB2_STATUS_STOPPED_ON_SYMLINK && fh->path) {
                 char *target;
@@ -1638,6 +1726,11 @@ _smb2_open_async_with_oplock_or_lease(struct smb2_context *smb2, const char *pat
                 free(req.create_context);
         }
 
+        if (caller_frees_pdu) {
+                fh->cancel_pdu = pdu;
+                fh->cancel_free_cb = free_cb;
+                pdu->free_cb = open_cancelled;
+        }
         pdu->caller_frees_pdu = caller_frees_pdu;
         smb2_queue_pdu(smb2, pdu);
 
@@ -2287,15 +2380,18 @@ fstat_cb_1(struct smb2_context *smb2, int status,
 {
         struct stat_cb_data *stat_data = private_data;
         struct smb2_query_info_reply *rep = command_data;
-        struct smb2_file_all_info *fs = rep->output_buffer;
+        struct smb2_file_all_info *fs;
         struct smb2_stat_64 *st = stat_data->st;
 
         if (status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, status, "Query info failed with "
+                                 "(0x%08x) %s", status, nterror_to_str(status));
                 stat_data->cb(smb2, -nterror_to_errno(status),
                        NULL, stat_data->cb_data);
                 free(stat_data);
                 return;
         }
+        fs = rep->output_buffer;
 
         smb2_set_stat_type(st, fs->basic.file_attributes,
                            stat_data->reparse_tag);
@@ -2364,8 +2460,13 @@ smb2_fstat_async(struct smb2_context *smb2, struct smb2fh *fh,
                 return -ENOMEM;
         }
 
+        /*
+         * Unrelated, with the real FileId: there is no CREATE in this
+         * chain and ksmbd only resolves the related-operation FileId
+         * from a CREATE, failing this with STATUS_FILE_CLOSED. It also
+         * keeps a failed attribute tag query from failing this one.
+         */
         req.file_info_class = SMB2_FILE_ALL_INFORMATION;
-        memcpy(req.file_id, compound_file_id, SMB2_FD_SIZE);
 
         next_pdu = smb2_cmd_query_info_async(smb2, &req, fstat_cb_1, stat_data);
         if (next_pdu == NULL) {
@@ -2374,7 +2475,7 @@ smb2_fstat_async(struct smb2_context *smb2, struct smb2fh *fh,
                 free(stat_data);
                 return -ENOMEM;
         }
-        smb2_add_compound_pdu(smb2, pdu, next_pdu);
+        smb2_add_unrelated_compound_pdu(smb2, pdu, next_pdu);
 
         smb2_queue_pdu(smb2, pdu);
 
@@ -2389,6 +2490,11 @@ getinfo_cb_3(struct smb2_context *smb2, int status,
 
         if (stat_data->status == SMB2_STATUS_SUCCESS) {
                 stat_data->status = status;
+        }
+        if (stat_data->status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, stat_data->status, "Query info failed with "
+                                 "(0x%08x) %s", stat_data->status,
+                                 nterror_to_str(stat_data->status));
         }
 
         stat_data->cb(smb2, -nterror_to_errno(stat_data->status),
@@ -2605,6 +2711,11 @@ trunc_cb_3(struct smb2_context *smb2, int status,
         if (trunc_data->status == SMB2_STATUS_SUCCESS) {
                 trunc_data->status = status;
         }
+        if (trunc_data->status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, trunc_data->status, "Truncate failed with "
+                                 "(0x%08x) %s", trunc_data->status,
+                                 nterror_to_str(trunc_data->status));
+        }
 
         trunc_data->cb(smb2, -nterror_to_errno(trunc_data->status),
                        NULL, trunc_data->cb_data);
@@ -2738,6 +2849,11 @@ new_name_cb_3(struct smb2_context *smb2, int status,
 
         if (new_name_data->status == SMB2_STATUS_SUCCESS) {
                 new_name_data->status = status;
+        }
+        if (new_name_data->status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, new_name_data->status, "Rename failed with "
+                                 "(0x%08x) %s", new_name_data->status,
+                                 nterror_to_str(new_name_data->status));
         }
 
         new_name_data->cb(smb2, -nterror_to_errno(new_name_data->status),
@@ -2900,6 +3016,10 @@ ftrunc_cb_1(struct smb2_context *smb2, int status,
 {
         struct create_cb_data *cb_data = private_data;
 
+        if (status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, status, "Truncate failed with "
+                                 "(0x%08x) %s", status, nterror_to_str(status));
+        }
         cb_data->cb(smb2, -nterror_to_errno(status),
                     NULL, cb_data->cb_data);
         free(cb_data);
@@ -3772,6 +3892,8 @@ disconnect_cb_2(struct smb2_context *smb2, int status,
         }
         close(smb2->fd);
         smb2->fd = SMB2_INVALID_SOCKET;
+        smb2_quic_reset(smb2);
+        smb2_rdma_reset(smb2);
 }
 
 static void
@@ -3842,6 +3964,10 @@ echo_cb(struct smb2_context *smb2, int status,
 {
         struct smb2_echo_data *cb_data = private_data;
 
+        if (status != SMB2_STATUS_SUCCESS) {
+                smb2_set_nterror(smb2, status, "Echo failed with (0x%08x) %s",
+                                 status, nterror_to_str(status));
+        }
         cb_data->cb(smb2, -nterror_to_errno(status),
                     NULL, cb_data->cb_data);
         free(cb_data);
