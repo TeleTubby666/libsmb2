@@ -1421,9 +1421,16 @@ set_nonblocking(t_socket fd)
          * so the call "succeeds" (ret=0) without the socket ever actually
          * becoming non-blocking. net_ioctl(FIONBIO) does the correct
          * translation internally, so use that instead of building the
-         * F_SETFL flags word ourselves. */
+         * F_SETFL flags word ourselves.
+         *
+         * Beware: net_ioctl() only accepts the FIONBIO value of libogc's own
+         * network.h, _IOW('f', 126, unsigned long) = 0x8004667e. Here
+         * FIONBIO can come from the toolchain's <sys/ioctl.h> instead (a
+         * different value; on the Wii it was 0x1), net_ioctl() then fails
+         * with EINVAL, the socket stays blocking and net_read() blocks when
+         * there is nothing to read. So pass the libogc value explicitly. */
         int one = 1;
-        net_ioctl(fd, FIONBIO, &one);
+        net_ioctl(fd, (u32)0x8004667e, &one);
 #else
         unsigned v;
         v = fcntl(fd, F_GETFL, 0);
